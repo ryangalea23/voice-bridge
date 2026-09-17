@@ -128,6 +128,30 @@ Then start it:
 First run builds a venv and installs dependencies. It opens a Cloudflare tunnel, points
 your Twilio number's webhook at it, and serves on port 8000.
 
+Add the Stop hook so Claude Code's replies actually reach the bridge. Open (or create)
+`settings.json` for the session you will call from, and add `voice_hook.py` as a Stop
+hook:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/path/to/voice-bridge/voice_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Without this, Claude Code never tells the bridge what it said, so a call connects and the
+agent works, but the caller hears nothing back.
+
 In a second terminal, start a session for calls to land in:
 
 ```powershell
@@ -144,6 +168,7 @@ Now call your number.
 | File | Job |
 |---|---|
 | `bridge.py` | FastAPI app: Twilio webhook, media stream, the three security gates |
+| `voice_hook.py` | Claude Code Stop hook: sends the reply text to the bridge |
 | `stt.py` | Deepgram streaming speech to text |
 | `tts.py` | edge-tts speech, encoded to 8kHz mu-law for the call |
 | `typing_sound.py` | Synthesised keyboard sound so the line is not silent mid-turn |
