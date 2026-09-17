@@ -13,13 +13,14 @@ if ($WorkDir -and (Test-Path $WorkDir)) {
 # Where voice-bridge is checked out. Set $env:VOICE_BRIDGE_DIR if it is
 # somewhere else; the default assumes this script sits next to it.
 $bridgeDir = if ($env:VOICE_BRIDGE_DIR) { $env:VOICE_BRIDGE_DIR } else { $PSScriptRoot }
-$bridgeToken = ""
+# voice-prompt.ps1 sits next to this script, or in the bridge folder if this
+# script was copied somewhere else.
+$promptLib = Join-Path $PSScriptRoot "voice-prompt.ps1"
+if (-not (Test-Path $promptLib)) { $promptLib = Join-Path $bridgeDir "voice-prompt.ps1" }
+. $promptLib
 $bridgeEnv = Join-Path $bridgeDir ".env"
-if (Test-Path $bridgeEnv) {
-    foreach ($line in Get-Content $bridgeEnv) {
-        if ($line -match '^\s*SESSION_TOKEN\s*=\s*(.+?)\s*$') { $bridgeToken = $Matches[1]; break }
-    }
-}
+$bridgeVars = Read-BridgeEnv $bridgeEnv
+$bridgeToken = if ($bridgeVars['SESSION_TOKEN']) { $bridgeVars['SESSION_TOKEN'] } else { "" }
 if (-not $bridgeToken) {
     Write-Host "No SESSION_TOKEN in $bridgeEnv - the bridge will reject this session" -ForegroundColor Yellow
 }
@@ -62,8 +63,17 @@ try {
 $env:CLAUDE_VOICE_SESSION = "1"
 $env:CLAUDE_SESSION_NUM   = $sessionNum.ToString()
 
+# Voice-specific rules for the model: confirm risky actions, act as coordinator.
+# These are instructions to the model, not a technical block.
+$confirmRisky = Get-OnOffSetting $bridgeVars 'CONFIRM_RISKY'
+$coordinator  = Get-OnOffSetting $bridgeVars 'VOICE_COORDINATOR'
+Write-Host "CONFIRM_RISKY=$(if ($confirmRisky) {'on'} else {'off'}) VOICE_COORDINATOR=$(if ($coordinator) {'on'} else {'off'})" -ForegroundColor Cyan
+$voicePrompt = Build-VoiceSystemPrompt $confirmRisky $coordinator
+$claudeArgs = @('--dangerously-skip-permissions')
+if ($voicePrompt) { $claudeArgs += @('--append-system-prompt', $voicePrompt) }
+
 try {
-    & claude --dangerously-skip-permissions @args
+    & claude @claudeArgs @args
 } finally {
     # Deregister from bridge.
     try {

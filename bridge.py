@@ -31,10 +31,12 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.request_validator import RequestValidator
 
-from inject import inject_prompt
+from inject import inject_prompt, send_escape
+import readback
 from stt import DeepgramSTT
 from tts import text_to_mulaw_chunks
-from voice_text import strip_fillers
+from voice_settings import load_settings, log_settings
+from voice_text import is_stop_command, strip_fillers
 import typing_sound
 
 load_dotenv()
@@ -114,6 +116,10 @@ def _check_config() -> None:
 
 
 _check_config()
+
+# Read-back, stop words and Deepgram keyterms. Read once here, not per call.
+SETTINGS = load_settings()
+log_settings(SETTINGS)
 HEARTBEAT_INTERVAL = 12.0
 # Typing sound replaces the old spoken filler phrases. Set TYPING_SOUND=0 for
 # pure silence while a turn runs.
@@ -168,6 +174,7 @@ class _CallState:
     interrupted: bool = False
     speak_since: float = 0.0
     outbound_q: asyncio.Queue = None
+    stop_hint_given: bool = False  # "say stop to cancel" is spoken once per call
 
     def reset(self) -> None:
         self.ws = None
@@ -175,6 +182,7 @@ class _CallState:
         self.active = False
         self.speaking = False
         self.interrupted = False
+        self.stop_hint_given = False
 
 _call = _CallState()
 
@@ -649,6 +657,56 @@ async def _on_speech_started() -> None:
         _call.interrupted = True
         await _clear_audio()
 
+def _with_stop_hint(phrase: str) -> str:
+    """Add "say stop to cancel" to the first read-back of a call only."""
+    if _call.stop_hint_given:
+        return phrase
+    _call.stop_hint_given = True
+    return f"{phrase}. {readback.STOP_HINT}"
+
+
+async def _haiku_restatement(text: str) -> Optional[str]:
+    """Haiku restatement, or None (with the reason logged) so the caller falls
+    back to the transcript read-back."""
+    timeout_s = SETTINGS.haiku_timeout_ms / 1000
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None, readback.haiku_restate, text, SETTINGS.anthropic_api_key, timeout_s
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Haiku read-back timed out after %dms - using transcript", SETTINGS.haiku_timeout_ms)
+    except readback.HaikuError as exc:
+        log.warning("Haiku read-back failed (%s) - using transcript", exc)
+    except Exception as exc:
+        log.warning("Haiku read-back error (%s) - using transcript", exc)
+    return None
+
+
+async def _speak_haiku_readback(text: str, haiku_task: "asyncio.Task[Optional[str]]") -> None:
+    restated = await haiku_task
+    phrase = f"I heard: {restated}" if restated else readback.transcript_readback(text)
+    # If the real answer already started, a late read-back would cut it off.
+    if _watcher_spoke_this_turn or not _turn_active:
+        log.info("Skipping late read-back, the answer is already out")
+        return
+    await _speak_content(_with_stop_hint(phrase))
+
+
+async def _handle_stop() -> None:
+    """Interrupt the running turn instead of typing the stop word as a prompt."""
+    log.info("Stop command - sending Escape")
+    ok = await asyncio.get_event_loop().run_in_executor(None, send_escape)
+    _stop_typing()
+    if ok:
+        await _speak_content("Stopped.")
+    else:
+        await _speak_content("Session not active. Nothing to stop.")
+
+
 async def _on_utterance(text: str) -> None:
     global _ack_idx, _watcher_spoke_this_turn
     text = strip_fillers(text)
@@ -656,20 +714,36 @@ async def _on_utterance(text: str) -> None:
         return
     log.info("Utterance: %r", text)
 
+    if is_stop_command(text, SETTINGS.stop_words):
+        await _handle_stop()
+        return
+
     if await _handle_voice_command(text):
         return
 
+    # Start Haiku before injecting so the two run side by side. Injection never
+    # waits on it.
+    haiku_task = None
+    if SETTINGS.readback == "haiku":
+        haiku_task = asyncio.create_task(_haiku_restatement(text))
+
     ok = await asyncio.get_event_loop().run_in_executor(None, inject_prompt, text)
     if not ok:
+        if haiku_task:
+            haiku_task.cancel()
         await _speak_content("Session not active. Please open Claude Code with the voice launcher.")
     else:
         _watcher_spoke_this_turn = False
-        # Short spoken ack the moment the user finishes speaking, then typing
-        # underneath until the real answer arrives. The repeating every-12s
-        # filler phrases are what got removed, not this.
-        ack = _ACK_PHRASES[_ack_idx % len(_ACK_PHRASES)]
-        _ack_idx += 1
-        asyncio.create_task(_speak_content(ack))
+        # Short spoken read-back (or ack) the moment the text is in, then typing
+        # underneath until the real answer arrives.
+        if SETTINGS.readback == "off":
+            ack = _ACK_PHRASES[_ack_idx % len(_ACK_PHRASES)]
+            _ack_idx += 1
+            asyncio.create_task(_speak_content(ack))
+        elif haiku_task:
+            asyncio.create_task(_speak_haiku_readback(text, haiku_task))
+        else:
+            asyncio.create_task(_speak_content(_with_stop_hint(readback.transcript_readback(text))))
         _start_typing()
         _start_watcher()
 
@@ -693,7 +767,11 @@ async def twilio_stream(ws: WebSocket) -> None:
     _call.outbound_q = asyncio.Queue()
     _last_speech_time = asyncio.get_event_loop().time()
 
-    stt = DeepgramSTT(on_utterance=_on_utterance, on_speech_started=_on_speech_started)
+    stt = DeepgramSTT(
+        on_utterance=_on_utterance,
+        on_speech_started=_on_speech_started,
+        keyterms=SETTINGS.deepgram_keyterms,
+    )
     sender_task = None
     started = False
 

@@ -22,6 +22,36 @@ from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 
 log = logging.getLogger(__name__)
 
+MODEL = "nova-2"
+
+
+def keyterm_options(model: str, keyterms) -> dict:
+    """Deepgram boosts listed words under a different option per model:
+    nova-3 takes `keyterm`, nova-2 and older take `keywords`."""
+    terms = [t for t in (keyterms or []) if t]
+    if not terms:
+        return {}
+    if model.startswith("nova-3"):
+        return {"keyterm": terms}
+    return {"keywords": terms}
+
+
+def build_live_options(
+    encoding: str, sample_rate: int, channels: int, keyterms=None, model: str = MODEL
+) -> LiveOptions:
+    return LiveOptions(
+        model=model,
+        language="en-US",
+        encoding=encoding,
+        sample_rate=sample_rate,
+        channels=channels,
+        interim_results=True,    # needed for utterance_end_ms buffering
+        vad_events=True,         # enables SpeechStarted + UtteranceEnd
+        utterance_end_ms="2000", # 2s without new words = end of utterance
+        endpointing=False,       # disable silence-based endpointing
+        **keyterm_options(model, keyterms),
+    )
+
 
 class DeepgramSTT:
     def __init__(
@@ -32,6 +62,7 @@ class DeepgramSTT:
         sample_rate: int = 8000,
         channels: int = 1,
         on_utterance_full: Callable[[str, float], Awaitable[None]] | None = None,
+        keyterms: list[str] | tuple[str, ...] | None = None,
     ):
         if on_utterance is None and on_utterance_full is None:
             raise ValueError("DeepgramSTT needs on_utterance or on_utterance_full")
@@ -41,6 +72,7 @@ class DeepgramSTT:
         self._encoding = encoding
         self._sample_rate = sample_rate
         self._channels = channels
+        self._keyterms = list(keyterms or [])
         self._conn = None
         self._accumulated: str = ""  # confirmed is_final segments
         self._current: str = ""      # latest interim
@@ -101,16 +133,8 @@ class DeepgramSTT:
         self._conn.on(LiveTranscriptionEvents.UtteranceEnd, _on_utterance_end)
         self._conn.on(LiveTranscriptionEvents.Error, _on_error)
 
-        opts = LiveOptions(
-            model="nova-2",
-            language="en-US",
-            encoding=self._encoding,
-            sample_rate=self._sample_rate,
-            channels=self._channels,
-            interim_results=True,    # needed for utterance_end_ms buffering
-            vad_events=True,         # enables SpeechStarted + UtteranceEnd
-            utterance_end_ms="2000", # 2s without new words = end of utterance
-            endpointing=False,       # disable silence-based endpointing
+        opts = build_live_options(
+            self._encoding, self._sample_rate, self._channels, self._keyterms
         )
         started = await self._conn.start(opts)
         if not started:

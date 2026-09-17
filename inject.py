@@ -59,6 +59,24 @@ def _force_foreground(hwnd: int) -> None:
             user32.AttachThreadInput(current_thread, target_thread, False)
 
 
+def send_escape() -> bool:
+    """Press Escape in the active claude-voice window to interrupt the turn."""
+    hwnd = _get_session_hwnd()
+    if not hwnd:
+        return False
+
+    try:
+        _force_foreground(hwnd)
+        time.sleep(0.1)
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0)
+        log.info("Sent Escape to HWND %s", hwnd)
+        return True
+    except Exception as exc:
+        log.error("Escape error: %s", exc)
+        return False
+
+
 def inject_prompt(text: str) -> bool:
     """Paste text + Enter into the active claude-voice window."""
     hwnd = _get_session_hwnd()

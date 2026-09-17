@@ -48,6 +48,12 @@ just means listening to silence.
 
 *(Captain will get its own repo. Link to follow.)*
 
+You do not need your own coordinator to get this behavior. With `VOICE_COORDINATOR=on`
+(the default), `claude-voice.ps1` tells the session to answer in one or two short spoken
+sentences, hand anything longer than about 10 seconds to background agents or background
+shell tasks, and report each result in one sentence when it lands. Set it to `off` if you
+want the session to work inline.
+
 ## Security
 
 This thing types what a caller says into a live terminal and presses Enter. Treat it that
@@ -99,6 +105,46 @@ than sealing the door. The gates above stop a stranger who finds your tunnel URL
 not stop someone who can spoof your number. For a personal machine that is a reasonable
 trade. Do not point this at anything you would not hand a stranger a keyboard to.
 
+## Mishearing and safety
+
+Speech to text gets words wrong, and the bridge types what it heard straight into the
+session. These settings give you a chance to catch a bad transcript. All of them live in
+`.env` and are read once at startup.
+
+**Read-back (`READBACK`).** Right after your words are typed in, the bridge tells you what
+it heard.
+
+- `transcript` (default): says "I heard:" and the cleaned transcript, cut to about 20
+  words. The first read-back of a call also says "Say stop to cancel."
+- `haiku`: asks Claude Haiku to restate your request in 15 words or fewer, and says that
+  instead. It only restates, it does not answer. It needs `ANTHROPIC_API_KEY`. If the key
+  is missing, the call errors, or it takes longer than `READBACK_HAIKU_TIMEOUT_MS`, that
+  turn falls back to the transcript read-back. The Haiku call runs alongside the typing,
+  so it never slows down getting your words into the session.
+- `off`: a short canned "Got it." like before.
+
+Read-back does not hold your words back. They are already in the session by the time you
+hear them. It tells you what is running so you can stop it.
+
+**Stop command.** Say just "stop", "cancel", "wait", "hold on" or "never mind" and the
+bridge presses Escape in the session window to interrupt the current turn, stops the
+typing sound and says "Stopped." The word is not typed in as a prompt. It only counts when
+it is the whole thing you said, so "stop the server" is still sent as a normal request.
+Change the list with `VOICE_STOP_WORDS`.
+
+**Confirm risky actions (`CONFIRM_RISKY`).** On by default. `claude-voice.ps1` adds a line
+to the session's system prompt: before anything destructive or outward-facing (deleting
+files or data, git push, force operations, deploys, sending email or messages, spending
+money, changing production), say in one sentence what it is about to do and wait for an
+explicit yes. If a request looks garbled, ask instead of guessing. Be clear on what this
+is: an instruction to the model, not a technical block. The session still runs with
+`--dangerously-skip-permissions`, and nothing in the bridge stops a tool call the model
+decides to make.
+
+**Boost hard words (`DEEPGRAM_KEYTERMS`).** A comma list of names and jargon Deepgram
+keeps getting wrong, such as your project names. They are sent to Deepgram as keywords
+(the right option for the `nova-2` model the bridge uses).
+
 ## Setup
 
 You need a Twilio number, a Deepgram key, `cloudflared`, and Python 3.10+.
@@ -118,6 +164,7 @@ Fill in `.env`:
 | `DEEPGRAM_API_KEY` | From the Deepgram console |
 | `ALLOWED_CALLERS` | **Required.** Your mobile in E.164, comma separated for more. |
 | `SESSION_TOKEN` | **Required.** `python -c "import secrets;print(secrets.token_urlsafe(32))"` |
+| `READBACK`, `VOICE_STOP_WORDS`, `CONFIRM_RISKY`, `VOICE_COORDINATOR`, `DEEPGRAM_KEYTERMS` | Optional. See [Mishearing and safety](#mishearing-and-safety) and `.env.example`. |
 
 Then start it:
 
@@ -173,10 +220,14 @@ Now call your number.
 | `tts.py` | edge-tts speech, encoded to 8kHz mu-law for the call |
 | `typing_sound.py` | Synthesised keyboard sound so the line is not silent mid-turn |
 | `inject.py` | Types text into the registered terminal window |
-| `voice_text.py` | Strips filler words before injecting |
+| `voice_text.py` | Strips filler words and spots stop commands before injecting |
+| `voice_settings.py` | Reads the read-back, stop word and keyterm settings |
+| `readback.py` | Builds the "I heard" read-back, including the Haiku restatement |
 | `desk_mic.py` / `desk-mic.ps1` | Same thing from your desk mic, no phone call |
 | `bridge.ps1` | Starts the tunnel, updates the Twilio webhook, runs the server |
 | `claude-voice.ps1` | Launches a Claude Code session and registers its window |
+| `voice-prompt.ps1` | Builds the confirm and coordinator system prompt text |
+| `tests/` | pytest suite. No phone, Deepgram or network needed: `python -m pytest tests` |
 
 ## Why Windows only
 
