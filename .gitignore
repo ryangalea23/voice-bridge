@@ -1,0 +1,22 @@
+# Secrets. This file holds live Twilio and Deepgram keys plus the phone
+# numbers allowed to drive your machine. It must never be committed.
+.env
+.env.*
+!.env.example
+
+# Local Python environment
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Backups and logs
+*.bak
+*.bak-*
+*.log
