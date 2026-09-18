@@ -37,8 +37,9 @@ public class VoiceWin {
 }
 
 # Spoken out loud by the bridge when no usable window was found, so it is one
-# plain sentence, not a stack trace.
-$script:VoiceWindowSpokenError = "This terminal cannot receive typed text. Start the voice launcher in a plain console window, then call back."
+# plain sentence, not a stack trace. The bridge only reads this after typing has
+# already failed, which means the console input buffer did not work either.
+$script:VoiceWindowSpokenError = "I could not type into that session. Start the voice launcher in a plain console window, then call back."
 
 function Get-ParentProcessId {
     param([int]$ProcessId)

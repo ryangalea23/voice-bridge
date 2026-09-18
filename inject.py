@@ -1,10 +1,19 @@
-"""Inject text prompts into the Claude Code voice session window.
+"""Inject text prompts into the Claude Code voice session.
 
-claude-voice.ps1 writes its console HWND to ~/.claude/voice-session.hwnd.
-inject.py reads that handle directly — no title matching needed.
+Two ways in, tried in that order:
 
-Uses AttachThreadInput before SetForegroundWindow to reliably steal focus
-on Windows 10/11, which blocks naive SetForegroundWindow from background processes.
+1. The console input buffer (console_inject.py). The text is written straight
+   into the session's console as key events. No focus, no clipboard, and it
+   works when the console window is hidden, which is what happens under Tabby,
+   Windows Terminal and VS Code.
+2. The old clipboard-and-focus path in this file: put the text on the clipboard,
+   pull the saved window to the front with AttachThreadInput plus
+   SetForegroundWindow, and send Ctrl+V and Enter. Kept as a fallback for cases
+   the first path cannot reach.
+
+INJECT_METHOD picks between them: auto (default, console then keys), console, or
+keys. claude-voice.ps1 writes the session's pid and window handle under
+~/.claude/ for both paths to read.
 """
 import ctypes
 import logging
@@ -17,9 +26,11 @@ import win32con
 import win32gui
 import win32process
 
+import console_inject
+
 log = logging.getLogger(__name__)
 
-HWND_FILE = os.path.expanduser(r"~\.claude\voice-session.hwnd")
+HWND_FILE = console_inject.HWND_FILE
 # claude-voice.ps1 writes this when it cannot find a window that can receive
 # typed text, e.g. a ConPTY terminal with no visible ancestor window. The text
 # is a spoken sentence, so the bridge can read it out instead of the generic
@@ -113,8 +124,8 @@ def _force_foreground(hwnd: int) -> None:
             user32.AttachThreadInput(current_thread, target_thread, False)
 
 
-def send_escape() -> bool:
-    """Press Escape in the active claude-voice window to interrupt the turn."""
+def _send_escape_keys() -> bool:
+    """Press Escape by focusing the saved window and sending the key."""
     hwnd = _get_session_hwnd()
     if not hwnd:
         return False
@@ -131,8 +142,8 @@ def send_escape() -> bool:
         return False
 
 
-def inject_prompt(text: str) -> bool:
-    """Paste text + Enter into the active claude-voice window."""
+def _inject_prompt_keys(text: str) -> bool:
+    """Paste text + Enter by focusing the saved window and sending the keys."""
     hwnd = _get_session_hwnd()
     if not hwnd:
         return False
@@ -166,3 +177,50 @@ def inject_prompt(text: str) -> bool:
     except Exception as exc:
         log.error("Injection error: %s", exc)
         return False
+
+
+def inject_method() -> str:
+    """Which path to use: auto (default), console, or keys."""
+    raw = (os.environ.get("INJECT_METHOD") or "").strip().lower()
+    if raw in ("auto", "console", "keys"):
+        return raw
+    if raw:
+        log.warning("Unknown INJECT_METHOD %r, using auto", raw)
+    return "auto"
+
+
+def _try_console(action, label: str, method: str) -> bool | None:
+    """Run the console path. None means the caller should fall back."""
+    if method == "keys":
+        return None
+    try:
+        ok, reason = action()
+    except Exception as exc:
+        ok, reason = False, f"{type(exc).__name__}: {exc}"
+    if ok:
+        log.info("%s via the console input buffer (%s)", label, reason)
+        return True
+    log.warning("Console input buffer failed for %s: %s", label, reason)
+    if method == "console":
+        return False
+    return None
+
+
+def send_escape() -> bool:
+    """Press Escape in the voice session to interrupt the turn."""
+    method = inject_method()
+    result = _try_console(console_inject.send_escape, "Escape", method)
+    if result is not None:
+        return result
+    log.info("Falling back to the focus-and-keys path for Escape")
+    return _send_escape_keys()
+
+
+def inject_prompt(text: str) -> bool:
+    """Type text + Enter into the voice session."""
+    method = inject_method()
+    result = _try_console(lambda: console_inject.inject_text(text), "Prompt", method)
+    if result is not None:
+        return result
+    log.info("Falling back to the focus-and-keys path for the prompt")
+    return _inject_prompt_keys(text)

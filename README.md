@@ -205,19 +205,20 @@ In a second terminal, start a session for calls to land in:
 .\claude-voice.ps1
 ```
 
-That registers the window so `inject.py` knows where to type. Without it a call connects
+That registers the session so `inject.py` knows where to type. Without it a call connects
 but reports no active session.
 
-Under Tabby, Windows Terminal or VS Code the shell runs through ConPTY, so the console
-window is real but hidden and cannot be brought to the front. The launcher notices that
-and saves the terminal app's own window instead, then warns you that typed text goes to
-whichever tab is in front - keep the Claude tab active during a call. Run
-`.\check-window.ps1` in a terminal to see which window it would pick. If it finds none,
-start the launcher in a classic console window:
+Your words go into that session's own console input buffer, as key events. Nothing takes
+focus, nothing touches your clipboard, and the session does not need to be the front
+window. Any terminal works, including Tabby, Windows Terminal and VS Code, where the
+console window is hidden behind ConPTY.
 
-```powershell
-Start-Process conhost.exe -ArgumentList 'pwsh.exe','-NoExit','-Command','.\claude-voice.ps1'
-```
+The launcher also saves a window handle for the older clipboard-and-focus path, which is
+only used if the console write fails. Run `.\check-window.ps1` to see which window that
+fallback would pick. Finding none is fine now, because typing does not depend on it.
+
+Set `INJECT_METHOD` in `.env` to force one path: `console`, `keys`, or `auto` (the
+default, console first).
 
 Now call your number.
 
@@ -230,32 +231,34 @@ Now call your number.
 | `stt.py` | Deepgram streaming speech to text |
 | `tts.py` | edge-tts speech, encoded to 8kHz mu-law for the call |
 | `typing_sound.py` | Synthesised keyboard sound so the line is not silent mid-turn |
-| `inject.py` | Types text into the registered terminal window |
+| `inject.py` | Types text into the session: console input buffer first, keys as fallback |
+| `console_inject.py` | Writes key events into the session's console, no focus or clipboard |
 | `voice_text.py` | Strips filler words and spots stop commands before injecting |
 | `voice_settings.py` | Reads the read-back, stop word and keyterm settings |
 | `readback.py` | Builds the "I heard" read-back, including the Haiku restatement |
 | `desk_mic.py` / `desk-mic.ps1` | Same thing from your desk mic, no phone call |
 | `bridge.ps1` | Starts the tunnel, updates the Twilio webhook, runs the server |
 | `claude-voice.ps1` | Launches a Claude Code session and registers its window |
-| `window-handle.ps1` | Picks the window to type into: the console, or the terminal app under ConPTY |
-| `check-window.ps1` | Prints which window would be used, without launching Claude Code |
+| `window-handle.ps1` | Picks the window for the fallback path: the console, or the terminal app under ConPTY |
+| `check-window.ps1` | Prints which window the fallback would use, without launching Claude Code |
 | `voice-prompt.ps1` | Builds the confirm and coordinator system prompt text |
 | `tests/` | pytest suite. No phone, Deepgram or network needed: `python -m pytest tests` |
 
 ## Why Windows only
 
-`inject.py` gets text into the terminal by putting it on the clipboard and sending Ctrl+V
-and Enter to a specific window handle. That needs `win32clipboard`, `win32gui`, and
-`AttachThreadInput` to steal focus, because Windows blocks a background process from
-calling `SetForegroundWindow` on its own.
+`console_inject.py` attaches to the session's console with `AttachConsole`, opens it as
+`CONIN$`, and pushes key events in with `WriteConsoleInputW`. All three are Windows
+console APIs. The fallback in `inject.py` is just as Windows-bound: it needs
+`win32clipboard`, `win32gui`, and `AttachThreadInput` to steal focus, because Windows
+blocks a background process from calling `SetForegroundWindow` on its own.
 
-Porting means rewriting that file for the target platform. The rest of the stack, Twilio,
+Porting means rewriting those two files for the target platform. The rest of the stack, Twilio,
 Deepgram, FastAPI, edge-tts, is cross-platform already. Pull requests welcome.
 
 ## Known rough edges
 
-- **It takes your clipboard.** Every injected message overwrites whatever you had copied.
-- **It steals focus.** The registered window jumps to the front on each message.
+- **The fallback path takes your clipboard and steals focus.** It only runs when writing
+  to the console fails, and you can switch it off with `INJECT_METHOD=console`.
 - **One call at a time.** There is a single global call object, not a pool.
 - **The tunnel URL changes** on every restart with a free Cloudflare quick tunnel, which is
   why `bridge.ps1` rewrites the Twilio webhook each time. A named tunnel avoids this.

@@ -30,9 +30,15 @@ $counterFile = "$env:USERPROFILE\.claude\voice-session-counter"
 $sessionNum = if (Test-Path $counterFile) { [int](Get-Content $counterFile -Raw) + 1 } else { 1 }
 [System.IO.File]::WriteAllText($counterFile, $sessionNum.ToString())
 
-# Find the window inject.py should type into. Under Tabby, Windows Terminal or
-# VS Code the console window is a hidden pseudo-console, so the resolver falls
-# back to the terminal app's own window. See window-handle.ps1.
+# inject.py types into this session's console input buffer, which needs this
+# process id and nothing else. Write it first, so injection works even when no
+# window can be found.
+$pidFile = "$env:USERPROFILE\.claude\voice-session.pid"
+[System.IO.File]::WriteAllText($pidFile, $PID.ToString())
+
+# The window handle is only for the older focus-and-keys fallback. Under Tabby,
+# Windows Terminal or VS Code the console window is a hidden pseudo-console, so
+# the resolver falls back to the terminal app's own window. See window-handle.ps1.
 $windowLib = Join-Path $PSScriptRoot "window-handle.ps1"
 if (-not (Test-Path $windowLib)) { $windowLib = Join-Path $bridgeDir "window-handle.ps1" }
 . $windowLib
@@ -51,16 +57,15 @@ if ($window.Kind -eq 'none') {
     Remove-Item $sessionHwndFile -ErrorAction SilentlyContinue
     Remove-Item $hwndKindFile -ErrorAction SilentlyContinue
     [System.IO.File]::WriteAllText($hwndErrorFile, $window.Message)
-    Write-Host "No window can receive typed text." -ForegroundColor Red
-    Write-Host "  The console window is hidden (this terminal uses ConPTY) and no parent window is visible." -ForegroundColor Red
-    Write-Host "  Voice injection is OFF for this session. Run claude-voice in a classic console window instead," -ForegroundColor Red
-    Write-Host "  for example: Start-Process conhost.exe -ArgumentList 'pwsh.exe','-NoExit','-Command','claude-voice'" -ForegroundColor Red
+    Write-Host "No window found for the focus-and-keys fallback." -ForegroundColor Yellow
+    Write-Host "  The console window is hidden (this terminal uses ConPTY) and no parent window is visible." -ForegroundColor Yellow
+    Write-Host "  Typing still works: text goes into this session's console input buffer (pid $PID)." -ForegroundColor Green
 } else {
     Remove-Item $hwndErrorFile -ErrorAction SilentlyContinue
     [System.IO.File]::WriteAllText($hwndFile, $hwnd.ToString())
     [System.IO.File]::WriteAllText($sessionHwndFile, $hwnd.ToString())
     [System.IO.File]::WriteAllText($hwndKindFile, $window.Kind)
-    Write-Host "Voice session #$sessionNum active (HWND: $hwnd, kind: $($window.Kind), owner: $($window.ProcessName))" -ForegroundColor Green
+    Write-Host "Voice session #$sessionNum active (pid $PID, HWND: $hwnd, kind: $($window.Kind), owner: $($window.ProcessName))" -ForegroundColor Green
     Write-Host "  $($window.Message)" -ForegroundColor DarkGray
     if ($window.Kind -eq 'terminal') {
         Write-Host "  Typed text goes to whichever TAB is in front of $($window.ProcessName). Keep this tab active during a call." -ForegroundColor Yellow
@@ -107,4 +112,5 @@ try {
     Remove-Item $sessionHwndFile -ErrorAction SilentlyContinue
     Remove-Item $hwndKindFile    -ErrorAction SilentlyContinue
     Remove-Item $hwndErrorFile   -ErrorAction SilentlyContinue
+    Remove-Item $pidFile         -ErrorAction SilentlyContinue
 }
