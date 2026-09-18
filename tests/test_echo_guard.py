@@ -229,14 +229,19 @@ def test_barge_in_ignored_while_the_bridge_speaks(monkeypatch):
 
     monkeypatch.setattr(bridge, "_clear_audio", fake_clear)
 
+    after_speaking = []
+
     async def scenario():
         await h.speak("A long answer that is still playing.")
+        # Speaking clears Twilio's buffer on purpose, so count only what the
+        # barge-in itself adds.
+        after_speaking.append(len(cleared))
         h.clock.advance(0.5)
         await bridge._on_speech_started()
         interrupted.append(bridge._call.interrupted)
 
     h.run(scenario)
-    assert cleared == []
+    assert len(cleared) - after_speaking[0] == 0
     assert interrupted == [False]
 
 
@@ -250,8 +255,11 @@ def test_barge_in_still_works_when_no_audio_is_playing(monkeypatch):
 
     monkeypatch.setattr(bridge, "_clear_audio", fake_clear)
 
+    after_speaking = []
+
     async def scenario():
         await h.speak("Short answer.")
+        after_speaking.append(len(cleared))   # speaking clears on purpose
         h.clock.advance(2.0 + 1.3)     # audio and tail both over
         # _on_speech_started uses the loop clock for its own 3s rule; make the
         # speech look old enough that the rule is satisfied.
@@ -260,7 +268,7 @@ def test_barge_in_still_works_when_no_audio_is_playing(monkeypatch):
         interrupted.append(bridge._call.interrupted)
 
     h.run(scenario)
-    assert cleared == [True]
+    assert len(cleared) - after_speaking[0] == 1
     assert interrupted == [True]
 
 

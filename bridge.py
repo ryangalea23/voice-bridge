@@ -422,7 +422,12 @@ async def _speak_content(text: str) -> None:
     my_version = _content_version
 
     _tool_version += 1
-    _drain_outbound()
+    # Drop our queue AND tell Twilio to drop what we already sent it. The typing
+    # sound is pushed ahead of real time, so Twilio can be holding several
+    # seconds of it. Without the clear event the caller sits through all of that
+    # before hearing the answer, which sounded like the bridge was slow when the
+    # reply had actually been ready for ten seconds.
+    await _clear_audio()
 
     if not _call.active:
         return
