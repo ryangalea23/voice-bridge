@@ -30,24 +30,42 @@ $counterFile = "$env:USERPROFILE\.claude\voice-session-counter"
 $sessionNum = if (Test-Path $counterFile) { [int](Get-Content $counterFile -Raw) + 1 } else { 1 }
 [System.IO.File]::WriteAllText($counterFile, $sessionNum.ToString())
 
-# Get this console window's HWND.
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class ConsoleHelper {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-}
-"@
-$hwnd = [ConsoleHelper]::GetConsoleWindow()
+# Find the window inject.py should type into. Under Tabby, Windows Terminal or
+# VS Code the console window is a hidden pseudo-console, so the resolver falls
+# back to the terminal app's own window. See window-handle.ps1.
+$windowLib = Join-Path $PSScriptRoot "window-handle.ps1"
+if (-not (Test-Path $windowLib)) { $windowLib = Join-Path $bridgeDir "window-handle.ps1" }
+. $windowLib
+$window = Resolve-VoiceWindow
+$hwnd = $window.Hwnd
 
-# Write HWND — shared file (active session) + per-session file.
 $hwndFile        = "$env:USERPROFILE\.claude\voice-session.hwnd"
 $sessionHwndFile = "$env:USERPROFILE\.claude\voice-session-$sessionNum.hwnd"
-[System.IO.File]::WriteAllText($hwndFile, $hwnd.ToString())
-[System.IO.File]::WriteAllText($sessionHwndFile, $hwnd.ToString())
+$hwndKindFile    = "$env:USERPROFILE\.claude\voice-session.hwnd.kind"
+$hwndErrorFile   = "$env:USERPROFILE\.claude\voice-session.hwnd.error"
 
-Write-Host "Voice session #$sessionNum active (HWND: $hwnd)" -ForegroundColor Green
+if ($window.Kind -eq 'none') {
+    # No usable window. Write no handle at all, so inject.py fails fast, and
+    # leave the reason where the bridge can read it out to the caller.
+    Remove-Item $hwndFile -ErrorAction SilentlyContinue
+    Remove-Item $sessionHwndFile -ErrorAction SilentlyContinue
+    Remove-Item $hwndKindFile -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($hwndErrorFile, $window.Message)
+    Write-Host "No window can receive typed text." -ForegroundColor Red
+    Write-Host "  The console window is hidden (this terminal uses ConPTY) and no parent window is visible." -ForegroundColor Red
+    Write-Host "  Voice injection is OFF for this session. Run claude-voice in a classic console window instead," -ForegroundColor Red
+    Write-Host "  for example: Start-Process conhost.exe -ArgumentList 'pwsh.exe','-NoExit','-Command','claude-voice'" -ForegroundColor Red
+} else {
+    Remove-Item $hwndErrorFile -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($hwndFile, $hwnd.ToString())
+    [System.IO.File]::WriteAllText($sessionHwndFile, $hwnd.ToString())
+    [System.IO.File]::WriteAllText($hwndKindFile, $window.Kind)
+    Write-Host "Voice session #$sessionNum active (HWND: $hwnd, kind: $($window.Kind), owner: $($window.ProcessName))" -ForegroundColor Green
+    Write-Host "  $($window.Message)" -ForegroundColor DarkGray
+    if ($window.Kind -eq 'terminal') {
+        Write-Host "  Typed text goes to whichever TAB is in front of $($window.ProcessName). Keep this tab active during a call." -ForegroundColor Yellow
+    }
+}
 
 # Register with bridge (best-effort — bridge may not be running yet).
 try {
@@ -87,4 +105,6 @@ try {
     $env:CLAUDE_SESSION_NUM   = ""
     Remove-Item $hwndFile        -ErrorAction SilentlyContinue
     Remove-Item $sessionHwndFile -ErrorAction SilentlyContinue
+    Remove-Item $hwndKindFile    -ErrorAction SilentlyContinue
+    Remove-Item $hwndErrorFile   -ErrorAction SilentlyContinue
 }

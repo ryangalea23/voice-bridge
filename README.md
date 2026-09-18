@@ -208,6 +208,17 @@ In a second terminal, start a session for calls to land in:
 That registers the window so `inject.py` knows where to type. Without it a call connects
 but reports no active session.
 
+Under Tabby, Windows Terminal or VS Code the shell runs through ConPTY, so the console
+window is real but hidden and cannot be brought to the front. The launcher notices that
+and saves the terminal app's own window instead, then warns you that typed text goes to
+whichever tab is in front - keep the Claude tab active during a call. Run
+`.\check-window.ps1` in a terminal to see which window it would pick. If it finds none,
+start the launcher in a classic console window:
+
+```powershell
+Start-Process conhost.exe -ArgumentList 'pwsh.exe','-NoExit','-Command','.\claude-voice.ps1'
+```
+
 Now call your number.
 
 ## Files
@@ -226,6 +237,8 @@ Now call your number.
 | `desk_mic.py` / `desk-mic.ps1` | Same thing from your desk mic, no phone call |
 | `bridge.ps1` | Starts the tunnel, updates the Twilio webhook, runs the server |
 | `claude-voice.ps1` | Launches a Claude Code session and registers its window |
+| `window-handle.ps1` | Picks the window to type into: the console, or the terminal app under ConPTY |
+| `check-window.ps1` | Prints which window would be used, without launching Claude Code |
 | `voice-prompt.ps1` | Builds the confirm and coordinator system prompt text |
 | `tests/` | pytest suite. No phone, Deepgram or network needed: `python -m pytest tests` |
 

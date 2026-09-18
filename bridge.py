@@ -31,12 +31,12 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.request_validator import RequestValidator
 
-from inject import inject_prompt, send_escape
+from inject import inject_prompt, send_escape, session_error
 import readback
 from stt import DeepgramSTT
 from tts import text_to_mulaw_chunks
 from voice_settings import load_settings, log_settings
-from voice_text import is_stop_command, strip_fillers
+from voice_text import is_echo_of, is_stop_command, strip_fillers
 import typing_sound
 
 load_dotenv()
@@ -151,6 +151,75 @@ _ack_idx: int = 0
 _tool_busy: int = 0
 _turn_active: bool = False
 
+# ── Echo guard ─────────────────────────────────────────────────────────────────
+#
+# The caller's phone speaker plays our own voice back into its microphone, so
+# Deepgram transcribes what the bridge just said and the bridge treats it as a
+# new request. On a real call that made an endless read-back loop.
+#
+# Two defences, both cheap:
+#   1. A playback clock. Outbound mu-law is 8000 bytes per second, so every
+#      chunk we queue says exactly how long it will play. While that audio is
+#      playing, and for ECHO_GUARD_MS after it drains, incoming speech is
+#      dropped. This is arithmetic on the audio we sent, not a guess.
+#   2. The exact text we last spoke. Anything equal to it, or a prefix of it,
+#      is dropped whenever it arrives - echo that lands after the tail.
+# Stop words bypass both, because interrupting is the whole point.
+
+MULAW_BYTES_PER_SECOND = 8000
+_DEFAULT_ECHO_GUARD_MS = 1200
+
+
+def _read_echo_guard_ms() -> int:
+    raw = os.environ.get("ECHO_GUARD_MS", "").strip()
+    if not raw:
+        return _DEFAULT_ECHO_GUARD_MS
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError
+        return value
+    except ValueError:
+        log.warning(
+            "ECHO_GUARD_MS=%r is not a whole number of milliseconds - using %d",
+            raw, _DEFAULT_ECHO_GUARD_MS,
+        )
+        return _DEFAULT_ECHO_GUARD_MS
+
+
+ECHO_GUARD_MS = _read_echo_guard_ms()
+log.info("Echo guard: %dms tail after outbound audio stops", ECHO_GUARD_MS)
+
+_playback_until: float = 0.0   # loop time when the audio we have queued runs out
+_last_spoken_text: str = ""    # exactly what the bridge last said
+
+
+def _now() -> float:
+    return asyncio.get_event_loop().time()
+
+
+def _note_outbound_audio(chunk: bytes) -> None:
+    """Advance the playback clock by this chunk's real duration."""
+    global _playback_until
+    _playback_until = max(_playback_until, _now()) + len(chunk) / MULAW_BYTES_PER_SECOND
+
+
+def _reset_playback_clock() -> None:
+    """Queued audio was thrown away, so it will never play."""
+    global _playback_until
+    _playback_until = 0.0
+
+
+def _remember_spoken(text: str) -> None:
+    global _last_spoken_text
+    _last_spoken_text = text
+
+
+def _echo_guard_active() -> bool:
+    """True while our own audio plays, plus the tail after it stops."""
+    return _now() < _playback_until + ECHO_GUARD_MS / 1000.0
+
+
 # ── Session registry ───────────────────────────────────────────────────────────
 
 # num -> {hwnd, last_text, last_time, transcript_path}
@@ -183,6 +252,8 @@ class _CallState:
         self.speaking = False
         self.interrupted = False
         self.stop_hint_given = False
+        _reset_playback_clock()
+        _remember_spoken("")
 
 _call = _CallState()
 
@@ -308,6 +379,19 @@ async def _audio_sender(ws: WebSocket) -> None:
 
 # ── Speech channels ────────────────────────────────────────────────────────────
 
+def _drain_outbound() -> None:
+    """Throw away audio we queued but have not sent, and stop the playback clock
+    counting it. Sent-but-not-yet-played audio needs the Twilio clear event on
+    top; see _clear_audio."""
+    if _call.outbound_q is not None:
+        while not _call.outbound_q.empty():
+            try:
+                _call.outbound_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+    _reset_playback_clock()
+
+
 async def _speak_tool(text: str) -> None:
     """Low-priority: progress phrases and heartbeat. Skipped if content is speaking."""
     global _tool_version, _last_speech_time
@@ -317,12 +401,14 @@ async def _speak_tool(text: str) -> None:
     _tool_version += 1
     my_version = _tool_version
     _last_speech_time = asyncio.get_event_loop().time()
+    _remember_spoken(text)
     _tool_busy += 1
     try:
         async for chunk in text_to_mulaw_chunks(text):
             if _tool_version != my_version or _call.interrupted or not _call.active:
                 return
             await _call.outbound_q.put(chunk)
+            _note_outbound_audio(chunk)
     except Exception as exc:
         log.error("Tool speak error: %s", exc)
     finally:
@@ -336,11 +422,7 @@ async def _speak_content(text: str) -> None:
     my_version = _content_version
 
     _tool_version += 1
-    while not _call.outbound_q.empty():
-        try:
-            _call.outbound_q.get_nowait()
-        except asyncio.QueueEmpty:
-            break
+    _drain_outbound()
 
     if not _call.active:
         return
@@ -349,12 +431,14 @@ async def _speak_content(text: str) -> None:
     _call.speaking = True
     _call.interrupted = False
     _call.speak_since = _last_speech_time
+    _remember_spoken(text)
     try:
         async for chunk in text_to_mulaw_chunks(text):
             if _content_version != my_version or _call.interrupted or not _call.active:
                 log.info("Content speak cancelled (v%d, mine=%d)", _content_version, my_version)
                 return
             await _call.outbound_q.put(chunk)
+            _note_outbound_audio(chunk)
     except Exception as exc:
         log.error("Content speak error: %s", exc)
     finally:
@@ -633,11 +717,7 @@ def _start_watcher() -> None:
 # ── STT utterance callbacks ────────────────────────────────────────────────────
 
 async def _clear_audio() -> None:
-    while not _call.outbound_q.empty():
-        try:
-            _call.outbound_q.get_nowait()
-        except asyncio.QueueEmpty:
-            break
+    _drain_outbound()
     if _call.ws and _call.stream_sid:
         try:
             await _call.ws.send_text(json.dumps({
@@ -650,6 +730,12 @@ async def _clear_audio() -> None:
 
 async def _on_speech_started() -> None:
     if not _call.active:
+        return
+    if _echo_guard_active():
+        # Our own voice coming back through the caller's speaker. Clearing the
+        # buffer here would cut off the sentence being spoken. Saying a stop
+        # word still interrupts, through _handle_stop.
+        log.info("Speech started while the bridge is speaking - not a barge-in")
         return
     elapsed = asyncio.get_event_loop().time() - _call.speak_since
     if elapsed > 3.0:
@@ -696,6 +782,16 @@ async def _speak_haiku_readback(text: str, haiku_task: "asyncio.Task[Optional[st
     await _speak_content(_with_stop_hint(phrase))
 
 
+def _no_session_phrase(fallback_tail: str) -> str:
+    """What to say when nothing can be typed. The launcher leaves a reason when
+    it could not find a window that accepts typed text; that reason is more
+    useful than "session not active"."""
+    reason = session_error()
+    if reason:
+        return reason
+    return f"Session not active. {fallback_tail}"
+
+
 async def _handle_stop() -> None:
     """Interrupt the running turn instead of typing the stop word as a prompt."""
     log.info("Stop command - sending Escape")
@@ -704,7 +800,7 @@ async def _handle_stop() -> None:
     if ok:
         await _speak_content("Stopped.")
     else:
-        await _speak_content("Session not active. Nothing to stop.")
+        await _speak_content(_no_session_phrase("Nothing to stop."))
 
 
 async def _on_utterance(text: str) -> None:
@@ -714,8 +810,24 @@ async def _on_utterance(text: str) -> None:
         return
     log.info("Utterance: %r", text)
 
+    # Stop words are checked before the echo guard: interrupting has to work
+    # while the bridge is talking, which is exactly when the guard is on.
     if is_stop_command(text, SETTINGS.stop_words):
         await _handle_stop()
+        return
+
+    if _echo_guard_active():
+        log.info(
+            "Echo guard dropped %r - the bridge is speaking, or within %dms of it",
+            text, ECHO_GUARD_MS,
+        )
+        return
+
+    if is_echo_of(text, _last_spoken_text):
+        log.info(
+            "Echo guard dropped %r - it repeats what the bridge just said (%r)",
+            text, _last_spoken_text,
+        )
         return
 
     if await _handle_voice_command(text):
@@ -731,7 +843,9 @@ async def _on_utterance(text: str) -> None:
     if not ok:
         if haiku_task:
             haiku_task.cancel()
-        await _speak_content("Session not active. Please open Claude Code with the voice launcher.")
+        await _speak_content(_no_session_phrase(
+            "Please open Claude Code with the voice launcher."
+        ))
     else:
         _watcher_spoke_this_turn = False
         # Short spoken read-back (or ack) the moment the text is in, then typing
