@@ -138,8 +138,9 @@ only picks the flavour, and only when `ACK_MODE=readback`. With `ACK_MODE=off` o
 Nothing here holds your words back. They are already in the session by the time you hear
 anything. It tells you what is running so you can stop it.
 
-**Interrupting (`ECHO_GUARD_MS`).** You can talk over the bridge at any point, including
-mid-sentence. It stops, throws away the rest of the audio, and takes what you said.
+**Interrupting (`ECHO_GUARD_MS`, `BARGE_IN_ON_INTERIM`).** You can talk over the bridge at
+any point, including mid-sentence. It stops, throws away the rest of the audio, and takes
+what you said.
 
 The catch is that your phone speaker plays the bridge's own voice back into your phone
 mic, so it hears itself. Left alone that made an endless loop: it read back its own
@@ -148,6 +149,14 @@ match is its own voice and is dropped. Anything else is you, and it stops talkin
 only possible while its audio is on the line plus `ECHO_GUARD_MS` after, so outside that
 window everything you say goes straight through. Short words like "yes" or "no" are never
 treated as echo, even when the bridge just said them.
+
+It decides this on partial transcripts, not finished ones. A finished utterance only
+arrives after you go quiet for `UTTERANCE_END_MS`, so waiting for one meant the bridge
+kept talking for as long as you did - nearly four seconds on one real call. Partial text
+arrives a few hundred milliseconds in, so the bridge stops almost as soon as you start.
+The partial words are only used to decide whether to stop talking; what gets typed into
+the session is still the finished sentence. Set `BARGE_IN_ON_INTERIM=off` to go back to
+deciding on finished utterances only.
 
 Talking over it also stops the work, not just the voice. That is
 `BARGE_IN_STOPS_CLAUDE=on`, the default: cutting in presses Escape in the session window

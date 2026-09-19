@@ -40,7 +40,13 @@ import readback
 from stt import DeepgramSTT
 from tts import text_to_mulaw_chunks
 from voice_settings import load_settings, log_settings
-from voice_text import is_echo_of, is_stop_command, strip_fillers
+from voice_text import (
+    MIN_ECHO_CHARS,
+    MIN_ECHO_WORDS,
+    is_echo_of,
+    is_stop_command,
+    strip_fillers,
+)
 import typing_sound
 
 load_dotenv()
@@ -201,10 +207,12 @@ _reply_verdict_turn: int = -1
 #      will play. That window (plus an ECHO_GUARD_MS tail for audio already in
 #      Twilio's buffer) is when echo is possible. It is arithmetic on what we
 #      sent, not a guess.
-#   2. Inside that window every utterance is compared with what we are saying
+#   2. Inside that window every transcript is compared with what we are saying
 #      and what we said just before. A match is echo and is dropped. Anything
 #      else is the caller talking over us: clear the audio, cancel the sentence,
-#      and handle the words normally.
+#      and handle the words normally. This runs on PARTIAL transcripts too
+#      (_on_interim), because a finished utterance needs UTTERANCE_END_MS of
+#      silence and so cannot arrive while the caller is still speaking.
 #   3. Outside the window the same text test still runs, for echo that lands
 #      after the tail.
 #
@@ -271,6 +279,18 @@ def _forget_spoken() -> None:
     global _last_spoken_text, _prev_spoken_text
     _last_spoken_text = ""
     _prev_spoken_text = ""
+
+
+# Interims keep arriving as a sentence grows: "no", "no i it's", "no i told you
+# not to". Only the first one that clears the tests may barge in, or the caller
+# would get an Escape per word. The latch lifts when the finished utterance
+# lands, so the next sentence can interrupt again.
+_interim_barged: bool = False
+
+
+def _reset_interim_latch() -> None:
+    global _interim_barged
+    _interim_barged = False
 
 
 def _audio_playing() -> bool:
@@ -344,6 +364,7 @@ class _CallState:
         _reset_playback_clock()
         _forget_spoken()
         _forget_interrupted_turns()
+        _reset_interim_latch()
 
 _call = _CallState()
 
@@ -999,8 +1020,8 @@ async def _on_speech_started() -> None:
         # Speech started is just voice energy; there is no transcript yet, so our
         # own voice and the caller's are indistinguishable here. Clearing now
         # would chop our sentence off every time the phone speaker fed us back.
-        # _on_utterance runs the text test a moment later and barges in then, so
-        # interrupting still works - it costs the length of one utterance.
+        # _on_interim runs the text test on the first partial transcript, a few
+        # hundred milliseconds later, and barges in there.
         log.info("Speech started while our audio plays - deciding at the transcript")
         return
     elapsed = asyncio.get_event_loop().time() - _call.speak_since
@@ -1008,6 +1029,57 @@ async def _on_speech_started() -> None:
         log.info("User speaking at elapsed=%.1fs — clearing buffer", elapsed)
         _call.interrupted = True
         await _clear_audio()
+
+def _interim_is_substantial(text: str) -> bool:
+    """True when a partial transcript is long enough to judge.
+
+    The floor is the same one the echo test uses (voice_text.MIN_ECHO_CHARS /
+    MIN_ECHO_WORDS), and on purpose. Under it, is_echo_of always answers "not
+    echo", so a one-word scrap of our own sentence coming back would look
+    exactly like the caller cutting in. Below the floor the bridge cannot tell
+    the two apart, so it waits for the next interim - which is a few hundred
+    milliseconds away, not four seconds.
+    """
+    return len(text) >= MIN_ECHO_CHARS and len(text.split()) >= MIN_ECHO_WORDS
+
+
+async def _on_interim(text: str) -> None:
+    """A partial transcript, while the caller is still talking.
+
+    This is what makes interrupting feel instant. The finished utterance cannot
+    arrive until UTTERANCE_END_MS of silence, so on a real call the bridge kept
+    talking for nearly four seconds while the caller said "no I told you not to
+    stop, you're still talking". Interims land a few hundred milliseconds in,
+    and they carry words, so the same text test that separates our own voice
+    from the caller's can run on them.
+
+    The interim text is never injected. The finished utterance still goes
+    through _on_utterance exactly as before.
+    """
+    global _interim_barged
+    if not SETTINGS.barge_in_on_interim:
+        return
+    if not _call.active or _interim_barged:
+        return
+    # Only while our own audio is on the line. Nothing to interrupt otherwise,
+    # and _on_utterance handles everything else a moment later.
+    if not _audio_playing():
+        return
+    text = strip_fillers(text)
+    if not text or not _interim_is_substantial(text):
+        return
+    if _looks_like_echo(text):
+        log.info("Interim %r is our own voice coming back - not a barge-in", text)
+        return
+    # A stop word gets Escape from _handle_stop when the utterance finishes.
+    # Barging in here as well would press Escape twice and count the turn as
+    # interrupted twice, so one reply too many would be dropped.
+    if is_stop_command(text, _stop_spellings()):
+        log.info("Interim %r is a stop word - leaving it to the utterance path", text)
+        return
+    _interim_barged = True
+    await _barge_in(f"caller spoke over us, from a partial transcript: {text!r}")
+
 
 def _with_stop_hint(phrase: str) -> str:
     """Add "say stop to cancel" to the first read-back of a call only."""
@@ -1072,6 +1144,8 @@ async def _handle_stop() -> None:
 
 async def _on_utterance(text: str) -> None:
     global _ack_idx, _watcher_spoke_this_turn
+    # The sentence is over, so the next one is allowed its own interim barge-in.
+    _reset_interim_latch()
     text = strip_fillers(text)
     if not text:
         return
@@ -1150,6 +1224,7 @@ async def twilio_stream(ws: WebSocket) -> None:
     stt = DeepgramSTT(
         on_utterance=_on_utterance,
         on_speech_started=_on_speech_started,
+        on_interim=_on_interim,
         keyterms=SETTINGS.deepgram_keyterms,
     )
     sender_task = None

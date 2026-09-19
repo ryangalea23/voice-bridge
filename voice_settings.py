@@ -46,6 +46,13 @@ DEFAULT_STOP_ALIASES: dict[str, tuple[str, ...]] = {
 # stops the work as well as the voice. off: it only stops the voice.
 DEFAULT_BARGE_IN_STOPS_CLAUDE = True
 
+# on: decide barge-in from Deepgram's interim transcripts, which land a few
+# hundred milliseconds into a sentence. off: wait for the finished utterance,
+# which needs UTTERANCE_END_MS of silence and so cannot arrive until the caller
+# stops talking. On a real call that left the bridge talking over the caller for
+# nearly four seconds.
+DEFAULT_BARGE_IN_ON_INTERIM = True
+
 
 @dataclass(frozen=True)
 class VoiceSettings:
@@ -55,6 +62,7 @@ class VoiceSettings:
     stop_words: tuple[str, ...] = DEFAULT_STOP_WORDS
     stop_aliases: tuple[str, ...] = field(default_factory=tuple)
     barge_in_stops_claude: bool = DEFAULT_BARGE_IN_STOPS_CLAUDE
+    barge_in_on_interim: bool = DEFAULT_BARGE_IN_ON_INTERIM
     deepgram_keyterms: tuple[str, ...] = field(default_factory=tuple)
     anthropic_api_key: str = ""
 
@@ -179,6 +187,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
         barge_in_stops_claude=_load_flag(
             env, "BARGE_IN_STOPS_CLAUDE", DEFAULT_BARGE_IN_STOPS_CLAUDE
         ),
+        barge_in_on_interim=_load_flag(
+            env, "BARGE_IN_ON_INTERIM", DEFAULT_BARGE_IN_ON_INTERIM
+        ),
         deepgram_keyterms=_split_list(env.get("DEEPGRAM_KEYTERMS", "")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", "").strip(),
     )
@@ -188,13 +199,14 @@ def log_settings(s: VoiceSettings) -> None:
     log.info(
         "Voice settings: ACK_MODE=%s READBACK=%s READBACK_HAIKU_TIMEOUT_MS=%d "
         "VOICE_STOP_WORDS=%s VOICE_STOP_ALIASES=%s BARGE_IN_STOPS_CLAUDE=%s "
-        "DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
+        "BARGE_IN_ON_INTERIM=%s DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
         s.ack_mode,
         s.readback,
         s.haiku_timeout_ms,
         ",".join(s.stop_words),
         ",".join(s.stop_aliases) or "<none>",
         "on" if s.barge_in_stops_claude else "off",
+        "on" if s.barge_in_on_interim else "off",
         ",".join(s.deepgram_keyterms) or "<none>",
         "set" if s.anthropic_api_key else "<not set>",
     )
