@@ -46,7 +46,7 @@ param(
     [string]$From,
     [string]$BridgeUrl,
     [ValidateSet("Enable", "DetectMessageEnd")][string]$MachineDetection = "Enable",
-    [int]$MachineDetectionTimeout = 15
+    [int]$MachineDetectionTimeout = '3'
 )
 
 $ErrorActionPreference = "Stop"

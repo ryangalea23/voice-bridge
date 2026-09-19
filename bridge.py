@@ -135,6 +135,10 @@ HEARTBEAT_INTERVAL = 12.0
 # pure silence while a turn runs.
 TYPING_SOUND = os.environ.get("TYPING_SOUND", "1") != "0"
 
+# First words the caller hears when the line opens. Kept short: it plays before
+# anything else can, so every extra word is dead air.
+GREETING = os.environ.get("GREETING", "Hello, this is Claude.")
+
 # Only used when ACK_MODE=short. On a real call a canned "Yup." right after a
 # question sounded like the answer to it, so the default is to say nothing.
 _ACK_PHRASES = [
@@ -1300,7 +1304,7 @@ async def twilio_stream(ws: WebSocket) -> None:
                 if not await _begin():
                     await ws.close(code=1011)
                     return
-                asyncio.create_task(_speak_content("Hello, Claude is listening."))
+                asyncio.create_task(_speak_content(GREETING))
 
             elif event == "media":
                 # Never feed audio anywhere before the ticket is redeemed.
