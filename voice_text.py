@@ -32,9 +32,16 @@ def normalize_for_echo(text: str) -> str:
 def is_echo_of(text: str, spoken: str, min_chars: int = MIN_ECHO_CHARS) -> bool:
     """True when `text` looks like the phone speaker playing `spoken` back.
 
-    Equal, or a prefix of what was said, after normalising. Very short or
-    single-word utterances are never treated as echo: "yes" is a real answer
-    even when the bridge just said "Yes, the tests pass."
+    Matches any whole run of words inside what was said, after normalising: the
+    whole thing, the start, the end, or a stretch out of the middle. Echo rarely
+    catches a clean sentence - the mic picks it up part-way through and loses the
+    end - so a prefix-only test let plenty of echo through.
+
+    The floor below matters more than the match now. This test is also what
+    decides whether the caller is interrupting, so treating a real word as echo
+    silently swallows a request. Anything under MIN_ECHO_CHARS characters or
+    MIN_ECHO_WORDS words is never echo: "yes", "no", "stop" and "wait" are
+    answers even when the bridge just said "Yes, the tests pass."
     """
     if not spoken:
         return False
@@ -42,7 +49,9 @@ def is_echo_of(text: str, spoken: str, min_chars: int = MIN_ECHO_CHARS) -> bool:
     said = normalize_for_echo(spoken)
     if not said or len(heard) < min_chars or len(heard.split()) < MIN_ECHO_WORDS:
         return False
-    return heard == said or said.startswith(heard + " ") or said.startswith(heard)
+    # Pad both sides so the run has to line up on word boundaries: "run the"
+    # must not match inside "overrun theatre".
+    return f" {heard} " in f" {said} "
 
 
 def is_stop_command(text: str, stop_words) -> bool:

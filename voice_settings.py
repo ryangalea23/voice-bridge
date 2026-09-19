@@ -16,12 +16,22 @@ log = logging.getLogger(__name__)
 
 READBACK_MODES = ("off", "transcript", "haiku")
 DEFAULT_READBACK = "transcript"
+# What the bridge says the moment your words are typed in.
+#   off       nothing, just the typing sound. The default, because a canned
+#             "Yup." right after a question sounds like an answer to it.
+#   short     one of the canned phrases.
+#   readback  the read-back, in whichever flavour READBACK names.
+# ACK_MODE decides WHETHER anything is said; READBACK only picks the flavour of
+# the read-back, and only when ACK_MODE=readback. So ACK_MODE wins.
+ACK_MODES = ("off", "short", "readback")
+DEFAULT_ACK = "off"
 DEFAULT_HAIKU_TIMEOUT_MS = 2500
 DEFAULT_STOP_WORDS = ("stop", "cancel", "wait", "hold on", "never mind")
 
 
 @dataclass(frozen=True)
 class VoiceSettings:
+    ack_mode: str = DEFAULT_ACK
     readback: str = DEFAULT_READBACK
     haiku_timeout_ms: int = DEFAULT_HAIKU_TIMEOUT_MS
     stop_words: tuple[str, ...] = DEFAULT_STOP_WORDS
@@ -43,6 +53,14 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
             readback, "|".join(READBACK_MODES), DEFAULT_READBACK,
         )
         readback = DEFAULT_READBACK
+
+    ack_mode = env.get("ACK_MODE", DEFAULT_ACK).strip().lower() or DEFAULT_ACK
+    if ack_mode not in ACK_MODES:
+        log.warning(
+            "ACK_MODE=%r is not one of %s - using %r",
+            ack_mode, "|".join(ACK_MODES), DEFAULT_ACK,
+        )
+        ack_mode = DEFAULT_ACK
 
     raw_timeout = env.get("READBACK_HAIKU_TIMEOUT_MS", "").strip()
     timeout_ms = DEFAULT_HAIKU_TIMEOUT_MS
@@ -68,6 +86,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
             log.warning("VOICE_STOP_WORDS=%r has no words - using the defaults", raw_stop)
 
     return VoiceSettings(
+        ack_mode=ack_mode,
         readback=readback,
         haiku_timeout_ms=timeout_ms,
         stop_words=stop_words,
@@ -78,15 +97,21 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
 
 def log_settings(s: VoiceSettings) -> None:
     log.info(
-        "Voice settings: READBACK=%s READBACK_HAIKU_TIMEOUT_MS=%d VOICE_STOP_WORDS=%s "
-        "DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
+        "Voice settings: ACK_MODE=%s READBACK=%s READBACK_HAIKU_TIMEOUT_MS=%d "
+        "VOICE_STOP_WORDS=%s DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
+        s.ack_mode,
         s.readback,
         s.haiku_timeout_ms,
         ",".join(s.stop_words),
         ",".join(s.deepgram_keyterms) or "<none>",
         "set" if s.anthropic_api_key else "<not set>",
     )
-    if s.readback == "haiku" and not s.anthropic_api_key:
+    if s.ack_mode == "readback" and s.readback == "off":
+        log.warning(
+            "ACK_MODE=readback but READBACK=off, so there is no read-back to say - "
+            "the bridge will stay quiet until the answer is ready, same as ACK_MODE=off"
+        )
+    if s.ack_mode == "readback" and s.readback == "haiku" and not s.anthropic_api_key:
         log.warning(
             "READBACK=haiku but ANTHROPIC_API_KEY is not set - every turn will "
             "fall back to the transcript read-back"

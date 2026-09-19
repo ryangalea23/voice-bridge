@@ -111,8 +111,16 @@ Speech to text gets words wrong, and the bridge types what it heard straight int
 session. These settings give you a chance to catch a bad transcript. All of them live in
 `.env` and are read once at startup.
 
-**Read-back (`READBACK`).** Right after your words are typed in, the bridge tells you what
-it heard.
+**What it says back (`ACK_MODE`).** Right after your words are typed in, the bridge can
+say something so you know they landed.
+
+- `off` (default): it says nothing and starts the typing sound. A canned "Yup." right
+  after a question sounds like the answer to the question, which was confusing on a real
+  call, so silence plus typing is the default.
+- `short`: one of the canned phrases, "On it.", "Got it." and so on.
+- `readback`: repeats what it heard, in the flavour `READBACK` picks.
+
+**Read-back flavour (`READBACK`).** Only used when `ACK_MODE=readback`.
 
 - `transcript` (default): says "I heard:" and the cleaned transcript, cut to about 20
   words. The first read-back of a call also says "Say stop to cancel."
@@ -121,10 +129,25 @@ it heard.
   is missing, the call errors, or it takes longer than `READBACK_HAIKU_TIMEOUT_MS`, that
   turn falls back to the transcript read-back. The Haiku call runs alongside the typing,
   so it never slows down getting your words into the session.
-- `off`: a short canned "Got it." like before.
+- `off`: nothing, the same as `ACK_MODE=off`.
 
-Read-back does not hold your words back. They are already in the session by the time you
-hear them. It tells you what is running so you can stop it.
+**Which wins.** `ACK_MODE` does. It decides whether anything is said at all. `READBACK`
+only picks the flavour, and only when `ACK_MODE=readback`. With `ACK_MODE=off` or `short`,
+`READBACK` has no effect.
+
+Nothing here holds your words back. They are already in the session by the time you hear
+anything. It tells you what is running so you can stop it.
+
+**Interrupting (`ECHO_GUARD_MS`).** You can talk over the bridge at any point, including
+mid-sentence. It stops, throws away the rest of the audio, and takes what you said.
+
+The catch is that your phone speaker plays the bridge's own voice back into your phone
+mic, so it hears itself. Left alone that made an endless loop: it read back its own
+read-back. The bridge handles both by comparing what it hears with what it is saying. A
+match is its own voice and is dropped. Anything else is you, and it stops talking. Echo is
+only possible while its audio is on the line plus `ECHO_GUARD_MS` after, so outside that
+window everything you say goes straight through. Short words like "yes" or "no" are never
+treated as echo, even when the bridge just said them.
 
 **Stop command.** Say just "stop", "cancel", "wait", "hold on" or "never mind" and the
 bridge presses Escape in the session window to interrupt the current turn, stops the
@@ -164,7 +187,7 @@ Fill in `.env`:
 | `DEEPGRAM_API_KEY` | From the Deepgram console |
 | `ALLOWED_CALLERS` | **Required.** Your mobile in E.164, comma separated for more. |
 | `SESSION_TOKEN` | **Required.** `python -c "import secrets;print(secrets.token_urlsafe(32))"` |
-| `READBACK`, `VOICE_STOP_WORDS`, `CONFIRM_RISKY`, `VOICE_COORDINATOR`, `DEEPGRAM_KEYTERMS` | Optional. See [Mishearing and safety](#mishearing-and-safety) and `.env.example`. |
+| `ACK_MODE`, `READBACK`, `VOICE_STOP_WORDS`, `CONFIRM_RISKY`, `VOICE_COORDINATOR`, `DEEPGRAM_KEYTERMS` | Optional. See [Mishearing and safety](#mishearing-and-safety) and `.env.example`. |
 
 Then start it:
 

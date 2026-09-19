@@ -1,4 +1,10 @@
-"""_on_utterance per READBACK mode, with injection, speech and Haiku mocked."""
+"""_on_utterance per ACK_MODE and READBACK mode, with injection, speech and
+Haiku mocked.
+
+ACK_MODE decides whether anything is said after your words are typed in; READBACK
+only picks the flavour of the read-back, and only when ACK_MODE=readback. Most of
+these tests are about the read-back, so the harness defaults to ACK_MODE=readback.
+"""
 import asyncio
 import threading
 import time
@@ -11,13 +17,16 @@ import readback
 
 
 class Harness:
-    def __init__(self, monkeypatch, mode="transcript", haiku=None, key="key", timeout_ms=2500):
+    def __init__(self, monkeypatch, mode="transcript", haiku=None, key="key",
+                 timeout_ms=2500, ack_mode="readback"):
         self.spoken: list[str] = []
         self.injected: list[tuple[str, float]] = []
         self.escapes = 0
         self.t0 = 0.0
+        self.typing_started = 0
         monkeypatch.setattr(bridge, "SETTINGS", replace(
-            bridge.SETTINGS, readback=mode, anthropic_api_key=key, haiku_timeout_ms=timeout_ms,
+            bridge.SETTINGS, readback=mode, ack_mode=ack_mode,
+            anthropic_api_key=key, haiku_timeout_ms=timeout_ms,
         ))
         monkeypatch.setattr(bridge, "TYPING_SOUND", False)
         monkeypatch.setattr(bridge, "_transcript_path", "")
@@ -36,6 +45,13 @@ class Harness:
             self.escapes += 1
             return True
         monkeypatch.setattr(bridge, "send_escape", escape)
+
+        # The real _start_typing, but with a stub loop: the live one sleeps until
+        # the turn ends, which would hang the test.
+        async def fake_typing_loop():
+            self.typing_started += 1
+        monkeypatch.setattr(bridge, "_typing_loop", fake_typing_loop)
+        monkeypatch.setattr(bridge, "TYPING_SOUND", True)
 
         if haiku is not None:
             monkeypatch.setattr(readback, "haiku_restate", haiku)
@@ -57,12 +73,46 @@ class Harness:
         bridge._stop_typing()
 
 
-def test_off_speaks_canned_ack(monkeypatch):
-    h = Harness(monkeypatch, mode="off")
+# ACK_MODE: what the bridge says the moment your words are typed in.
+
+def test_ack_off_says_nothing_but_starts_typing(monkeypatch):
+    """The default. On a real call a canned "Yup." right after a question sounded
+    like the answer to the question. Silence plus typing says "working" instead."""
+    h = Harness(monkeypatch, ack_mode="off")
+    h.run("run the tests")
+    assert h.injected[0][0] == "run the tests"
+    assert h.spoken == []
+    assert h.typing_started == 1
+
+
+def test_ack_off_ignores_readback_setting(monkeypatch):
+    """ACK_MODE wins. READBACK only picks the flavour when ACK_MODE=readback."""
+    h = Harness(monkeypatch, mode="transcript", ack_mode="off")
+    h.run("run the tests")
+    assert h.spoken == []
+
+
+def test_ack_short_speaks_canned_phrase(monkeypatch):
+    h = Harness(monkeypatch, ack_mode="short")
     h.run("run the tests")
     assert h.injected[0][0] == "run the tests"
     assert len(h.spoken) == 1 and h.spoken[0] in bridge._ACK_PHRASES
     assert not any(s.startswith("I heard") for s in h.spoken)
+    assert h.typing_started == 1
+
+
+def test_ack_readback_speaks_the_read_back(monkeypatch):
+    h = Harness(monkeypatch, mode="transcript", ack_mode="readback")
+    h.run("run the tests")
+    assert h.spoken == ["I heard: run the tests. Say stop to cancel."]
+
+
+def test_ack_readback_with_readback_off_says_nothing(monkeypatch):
+    """Documented corner: nothing to read back, so it behaves like ACK_MODE=off."""
+    h = Harness(monkeypatch, mode="off", ack_mode="readback")
+    h.run("run the tests")
+    assert h.spoken == []
+    assert h.typing_started == 1
 
 
 def test_transcript_speaks_what_was_heard_and_hint_once(monkeypatch):

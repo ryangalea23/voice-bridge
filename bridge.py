@@ -125,6 +125,8 @@ HEARTBEAT_INTERVAL = 12.0
 # pure silence while a turn runs.
 TYPING_SOUND = os.environ.get("TYPING_SOUND", "1") != "0"
 
+# Only used when ACK_MODE=short. On a real call a canned "Yup." right after a
+# question sounded like the answer to it, so the default is to say nothing.
 _ACK_PHRASES = [
     "On it.",
     "Got it.",
@@ -157,14 +159,27 @@ _turn_active: bool = False
 # Deepgram transcribes what the bridge just said and the bridge treats it as a
 # new request. On a real call that made an endless read-back loop.
 #
-# Two defences, both cheap:
-#   1. A playback clock. Outbound mu-law is 8000 bytes per second, so every
-#      chunk we queue says exactly how long it will play. While that audio is
-#      playing, and for ECHO_GUARD_MS after it drains, incoming speech is
-#      dropped. This is arithmetic on the audio we sent, not a guess.
-#   2. The exact text we last spoke. Anything equal to it, or a prefix of it,
-#      is dropped whenever it arrives - echo that lands after the tail.
-# Stop words bypass both, because interrupting is the whole point.
+# The first version of this guard dropped EVERY utterance that arrived while our
+# audio was playing. It killed the loop and it killed barge-in with it: the
+# caller could no longer cut the bridge off mid-answer, which is the feature
+# people use most. So the guard no longer asks "is our audio playing", it asks
+# "are these our own words".
+#
+#   1. A playback clock says when our audio is on the line. Outbound mu-law is
+#      8000 bytes per second, so every chunk we queue says exactly how long it
+#      will play. That window (plus an ECHO_GUARD_MS tail for audio already in
+#      Twilio's buffer) is when echo is possible. It is arithmetic on what we
+#      sent, not a guess.
+#   2. Inside that window every utterance is compared with what we are saying
+#      and what we said just before. A match is echo and is dropped. Anything
+#      else is the caller talking over us: clear the audio, cancel the sentence,
+#      and handle the words normally.
+#   3. Outside the window the same text test still runs, for echo that lands
+#      after the tail.
+#
+# Stop words are checked before all of it, because interrupting is the point.
+# The text test has a minimum length (voice_text.MIN_ECHO_CHARS / MIN_ECHO_WORDS)
+# so a short real answer - "yes", "no", "sure" - is never mistaken for echo.
 
 MULAW_BYTES_PER_SECOND = 8000
 _DEFAULT_ECHO_GUARD_MS = 1200
@@ -191,7 +206,8 @@ ECHO_GUARD_MS = _read_echo_guard_ms()
 log.info("Echo guard: %dms tail after outbound audio stops", ECHO_GUARD_MS)
 
 _playback_until: float = 0.0   # loop time when the audio we have queued runs out
-_last_spoken_text: str = ""    # exactly what the bridge last said
+_last_spoken_text: str = ""    # exactly what the bridge is saying, or said last
+_prev_spoken_text: str = ""    # the one before that; echo often lags a sentence
 
 
 def _now() -> float:
@@ -211,13 +227,40 @@ def _reset_playback_clock() -> None:
 
 
 def _remember_spoken(text: str) -> None:
-    global _last_spoken_text
+    global _last_spoken_text, _prev_spoken_text
+    if text != _last_spoken_text:
+        _prev_spoken_text = _last_spoken_text
     _last_spoken_text = text
 
 
+def _forget_spoken() -> None:
+    """New call, so nothing we said before can be echoing now."""
+    global _last_spoken_text, _prev_spoken_text
+    _last_spoken_text = ""
+    _prev_spoken_text = ""
+
+
+def _audio_playing() -> bool:
+    """True while the audio we queued is still on the line."""
+    return _now() < _playback_until
+
+
 def _echo_guard_active() -> bool:
-    """True while our own audio plays, plus the tail after it stops."""
+    """True while our own audio plays, plus the tail after it stops. Inside this
+    window echo is possible, so the text test below decides. Outside it, echo is
+    only possible from audio we have long forgotten."""
     return _now() < _playback_until + ECHO_GUARD_MS / 1000.0
+
+
+def _looks_like_echo(text: str) -> bool:
+    """True when the utterance is our own voice coming back, matched against what
+    we are saying now and the sentence before it."""
+    if is_echo_of(text, _last_spoken_text):
+        return True
+    # The earlier sentence only counts while echo is still possible - the mic can
+    # run a sentence behind us. Later on it is just something we said a while ago,
+    # and the caller is free to say it back on purpose.
+    return _echo_guard_active() and is_echo_of(text, _prev_spoken_text)
 
 
 # ── Session registry ───────────────────────────────────────────────────────────
@@ -253,7 +296,7 @@ class _CallState:
         self.interrupted = False
         self.stop_hint_given = False
         _reset_playback_clock()
-        _remember_spoken("")
+        _forget_spoken()
 
 _call = _CallState()
 
@@ -733,14 +776,33 @@ async def _clear_audio() -> None:
         except Exception as exc:
             log.warning("Could not send clear: %s", exc)
 
+async def _barge_in(reason: str) -> None:
+    """The caller talked over us and it is not our own voice coming back. Stop
+    speaking at once: cancel the sentence in flight, drop our queue, and tell
+    Twilio to throw away what it is already holding."""
+    global _content_version, _tool_version
+    log.info("Barge-in: %s", reason)
+    # Bumping both versions makes the running _speak_content and _speak_tool
+    # loops see they are stale and stop feeding chunks.
+    _content_version += 1
+    _tool_version += 1
+    _call.interrupted = True
+    # The cancelled _speak_content will not clear this itself - its own version
+    # check no longer matches - so clear it here.
+    _call.speaking = False
+    await _clear_audio()
+
+
 async def _on_speech_started() -> None:
     if not _call.active:
         return
-    if _echo_guard_active():
-        # Our own voice coming back through the caller's speaker. Clearing the
-        # buffer here would cut off the sentence being spoken. Saying a stop
-        # word still interrupts, through _handle_stop.
-        log.info("Speech started while the bridge is speaking - not a barge-in")
+    if _audio_playing():
+        # Speech started is just voice energy; there is no transcript yet, so our
+        # own voice and the caller's are indistinguishable here. Clearing now
+        # would chop our sentence off every time the phone speaker fed us back.
+        # _on_utterance runs the text test a moment later and barges in then, so
+        # interrupting still works - it costs the length of one utterance.
+        log.info("Speech started while our audio plays - deciding at the transcript")
         return
     elapsed = asyncio.get_event_loop().time() - _call.speak_since
     if elapsed > 3.0:
@@ -821,19 +883,18 @@ async def _on_utterance(text: str) -> None:
         await _handle_stop()
         return
 
-    if _echo_guard_active():
+    # Our own voice is only on the line while our audio plays, plus the tail. In
+    # that window, and after it, the same question decides: are these our words?
+    if _looks_like_echo(text):
         log.info(
-            "Echo guard dropped %r - the bridge is speaking, or within %dms of it",
-            text, ECHO_GUARD_MS,
-        )
-        return
-
-    if is_echo_of(text, _last_spoken_text):
-        log.info(
-            "Echo guard dropped %r - it repeats what the bridge just said (%r)",
+            "Echo dropped %r - it repeats what the bridge just said (%r)",
             text, _last_spoken_text,
         )
         return
+
+    # Not our words, and we are still talking, so the caller is cutting in.
+    if _echo_guard_active():
+        await _barge_in(f"caller spoke over us: {text!r}")
 
     if await _handle_voice_command(text):
         return
@@ -841,7 +902,7 @@ async def _on_utterance(text: str) -> None:
     # Start Haiku before injecting so the two run side by side. Injection never
     # waits on it.
     haiku_task = None
-    if SETTINGS.readback == "haiku":
+    if SETTINGS.ack_mode == "readback" and SETTINGS.readback == "haiku":
         haiku_task = asyncio.create_task(_haiku_restatement(text))
 
     ok = await asyncio.get_event_loop().run_in_executor(None, inject_prompt, text)
@@ -853,15 +914,15 @@ async def _on_utterance(text: str) -> None:
         ))
     else:
         _watcher_spoke_this_turn = False
-        # Short spoken read-back (or ack) the moment the text is in, then typing
-        # underneath until the real answer arrives.
-        if SETTINGS.readback == "off":
+        # What to say the moment the text is in. ACK_MODE decides; the typing
+        # sound runs underneath either way, so silence still sounds like work.
+        if SETTINGS.ack_mode == "short":
             ack = _ACK_PHRASES[_ack_idx % len(_ACK_PHRASES)]
             _ack_idx += 1
             asyncio.create_task(_speak_content(ack))
-        elif haiku_task:
+        elif SETTINGS.ack_mode == "readback" and haiku_task:
             asyncio.create_task(_speak_haiku_readback(text, haiku_task))
-        else:
+        elif SETTINGS.ack_mode == "readback" and SETTINGS.readback != "off":
             asyncio.create_task(_speak_content(_with_stop_hint(readback.transcript_readback(text))))
         _start_typing()
         _start_watcher()
