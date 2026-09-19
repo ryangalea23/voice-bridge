@@ -53,6 +53,16 @@ DEFAULT_BARGE_IN_STOPS_CLAUDE = True
 # nearly four seconds.
 DEFAULT_BARGE_IN_ON_INTERIM = True
 
+# on: the PreToolUse hook speaks a canned line for each tool, e.g. "Reading
+# bridge.py...". off: the hook is accepted and nothing is said.
+#
+# The default is off because Claude now narrates its own steps (VOICE_NARRATE in
+# voice-prompt.ps1), and Claude knows what it is doing while a canned phrase only
+# knows the tool name. On a real call the caller asked for the weather and heard
+# "Searching code...". Two voices talking over each other is worse than either
+# one alone, so only turn this on with VOICE_NARRATE=off.
+DEFAULT_TOOL_PHRASES = False
+
 
 @dataclass(frozen=True)
 class VoiceSettings:
@@ -63,6 +73,7 @@ class VoiceSettings:
     stop_aliases: tuple[str, ...] = field(default_factory=tuple)
     barge_in_stops_claude: bool = DEFAULT_BARGE_IN_STOPS_CLAUDE
     barge_in_on_interim: bool = DEFAULT_BARGE_IN_ON_INTERIM
+    tool_phrases: bool = DEFAULT_TOOL_PHRASES
     deepgram_keyterms: tuple[str, ...] = field(default_factory=tuple)
     anthropic_api_key: str = ""
 
@@ -190,6 +201,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
         barge_in_on_interim=_load_flag(
             env, "BARGE_IN_ON_INTERIM", DEFAULT_BARGE_IN_ON_INTERIM
         ),
+        tool_phrases=_load_flag(env, "TOOL_PHRASES", DEFAULT_TOOL_PHRASES),
         deepgram_keyterms=_split_list(env.get("DEEPGRAM_KEYTERMS", "")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", "").strip(),
     )
@@ -199,7 +211,8 @@ def log_settings(s: VoiceSettings) -> None:
     log.info(
         "Voice settings: ACK_MODE=%s READBACK=%s READBACK_HAIKU_TIMEOUT_MS=%d "
         "VOICE_STOP_WORDS=%s VOICE_STOP_ALIASES=%s BARGE_IN_STOPS_CLAUDE=%s "
-        "BARGE_IN_ON_INTERIM=%s DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
+        "BARGE_IN_ON_INTERIM=%s TOOL_PHRASES=%s DEEPGRAM_KEYTERMS=%s "
+        "ANTHROPIC_API_KEY=%s",
         s.ack_mode,
         s.readback,
         s.haiku_timeout_ms,
@@ -207,6 +220,7 @@ def log_settings(s: VoiceSettings) -> None:
         ",".join(s.stop_aliases) or "<none>",
         "on" if s.barge_in_stops_claude else "off",
         "on" if s.barge_in_on_interim else "off",
+        "on" if s.tool_phrases else "off",
         ",".join(s.deepgram_keyterms) or "<none>",
         "set" if s.anthropic_api_key else "<not set>",
     )

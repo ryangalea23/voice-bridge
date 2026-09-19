@@ -193,6 +193,20 @@ is: an instruction to the model, not a technical block. The session still runs w
 `--dangerously-skip-permissions`, and nothing in the bridge stops a tool call the model
 decides to make.
 
+**Claude fills the silence itself (`VOICE_NARRATE`, `TOOL_PHRASES`).** On by default.
+`claude-voice.ps1` tells the session to open every reply with one short spoken sentence
+that shows it understood the request, before it touches a tool, and to say one short line
+about any step that will take more than a moment. The caller hears this live: the
+transcript watcher speaks each block of assistant text as it is written, not only at the
+end of a turn, so a line written before a tool call goes out while the tool is still
+running. Set `VOICE_NARRATE=off` to drop those instructions.
+
+`TOOL_PHRASES` is the older way of filling the same silence: a canned line per tool call,
+built from the tool name by the `PreToolUse` hook. It is off by default now, because Claude
+knows what it is doing and a tool name does not. On a real call the caller asked for the
+weather and heard "Searching code...". Turn it on only with `VOICE_NARRATE=off`, or two
+voices talk over each other.
+
 **Boost hard words (`DEEPGRAM_KEYTERMS`).** A comma list of names and jargon Deepgram
 keeps getting wrong, such as your project names. They are sent to Deepgram as keywords
 (the right option for the `nova-2` model the bridge uses).
@@ -216,7 +230,7 @@ Fill in `.env`:
 | `DEEPGRAM_API_KEY` | From the Deepgram console |
 | `ALLOWED_CALLERS` | **Required.** Your mobile in E.164, comma separated for more. |
 | `SESSION_TOKEN` | **Required.** `python -c "import secrets;print(secrets.token_urlsafe(32))"` |
-| `ACK_MODE`, `READBACK`, `VOICE_STOP_WORDS`, `CONFIRM_RISKY`, `VOICE_COORDINATOR`, `DEEPGRAM_KEYTERMS` | Optional. See [Mishearing and safety](#mishearing-and-safety) and `.env.example`. |
+| `ACK_MODE`, `READBACK`, `VOICE_STOP_WORDS`, `CONFIRM_RISKY`, `VOICE_COORDINATOR`, `VOICE_NARRATE`, `TOOL_PHRASES`, `DEEPGRAM_KEYTERMS` | Optional. See [Mishearing and safety](#mishearing-and-safety) and `.env.example`. |
 
 Then start it:
 

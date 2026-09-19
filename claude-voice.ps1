@@ -86,12 +86,14 @@ try {
 $env:CLAUDE_VOICE_SESSION = "1"
 $env:CLAUDE_SESSION_NUM   = $sessionNum.ToString()
 
-# Voice-specific rules for the model: confirm risky actions, act as coordinator.
+# Voice-specific rules for the model: confirm risky actions, act as coordinator,
+# acknowledge and narrate out loud so the line is never silent.
 # These are instructions to the model, not a technical block.
 $confirmRisky = Get-OnOffSetting $bridgeVars 'CONFIRM_RISKY'
 $coordinator  = Get-OnOffSetting $bridgeVars 'VOICE_COORDINATOR'
-Write-Host "CONFIRM_RISKY=$(if ($confirmRisky) {'on'} else {'off'}) VOICE_COORDINATOR=$(if ($coordinator) {'on'} else {'off'})" -ForegroundColor Cyan
-$voicePrompt = Build-VoiceSystemPrompt $confirmRisky $coordinator
+$narrate      = Get-OnOffSetting $bridgeVars 'VOICE_NARRATE'
+Write-Host "CONFIRM_RISKY=$(if ($confirmRisky) {'on'} else {'off'}) VOICE_COORDINATOR=$(if ($coordinator) {'on'} else {'off'}) VOICE_NARRATE=$(if ($narrate) {'on'} else {'off'})" -ForegroundColor Cyan
+$voicePrompt = Build-VoiceSystemPrompt $confirmRisky $coordinator $narrate
 $claudeArgs = @('--dangerously-skip-permissions')
 if ($voicePrompt) { $claudeArgs += @('--append-system-prompt', $voicePrompt) }
 

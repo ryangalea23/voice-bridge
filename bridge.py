@@ -626,8 +626,37 @@ async def _speak_content(text: str) -> None:
 
 # ── Rich tool phrases ──────────────────────────────────────────────────────────
 
+def _spoken_query(query: str, limit: int = 40) -> str:
+    """A search query short enough to say, cut at a word, never mid-word.
+
+    Cutting at a fixed character count turned "what is the weather today" into
+    "what is the weather t", which sounds like a glitch out of a phone.
+    """
+    words = " ".join(query.split())
+    if len(words) <= limit:
+        return words
+    cut = words[:limit].rsplit(" ", 1)[0]
+    return cut or words[:limit]
+
+
 def _build_tool_phrase(tool: str, inp: dict) -> Optional[str]:
+    """One short spoken line for a tool call, or None for tools worth no words.
+
+    Order matters, because these are substring tests over real Claude Code tool
+    names: WebSearch, WebFetch, Read, Write, Edit, Glob, Grep, Bash, Task,
+    TodoWrite. WebSearch has to come before the generic search branch, or a web
+    lookup says "Searching code..." - which is what a caller asking for the
+    weather actually heard. TodoWrite has to come before the write branch, or a
+    checklist update says "Writing file...".
+    """
     t = tool.lower()
+    if "websearch" in t or "web_search" in t:
+        short = _spoken_query(inp.get("query", ""))
+        return f"Looking up {short} on the web..." if short else "Looking that up on the web..."
+    if "webfetch" in t or "web_fetch" in t or "fetch" in t:
+        return "Opening that page..."
+    if "todo" in t:
+        return "Updating my to-do list..."
     if "read" in t:
         path = inp.get("file_path", inp.get("path", ""))
         name = os.path.basename(path) if path else ""
@@ -651,14 +680,8 @@ def _build_tool_phrase(tool: str, inp: dict) -> Optional[str]:
         cmd = inp.get("command", "").strip()
         first = cmd.split()[0][:20] if cmd else ""
         return f"Running {first}..." if first else "Running command..."
-    if "web_search" in t:
-        query = inp.get("query", "")
-        short = query[:25] if query else ""
-        return f"Searching the web for {short}..." if short else "Searching the web..."
-    if "web_fetch" in t or "fetch" in t:
-        return "Fetching page..."
-    if "agent" in t:
-        return "Spinning up agent..."
+    if "task" in t or "agent" in t:
+        return "Handing that to a helper agent..."
     if "notebook" in t:
         return "Editing notebook..."
     return None
@@ -1372,6 +1395,11 @@ async def tool_use(request: Request) -> dict:
     client_ip = request.client.host if request.client else ""
     if client_ip not in ("127.0.0.1", "::1"):
         return Response(status_code=403)
+
+    # Claude narrates its own steps now, so the canned phrases are off by
+    # default. Still accept the post, so the hook never sees an error.
+    if not SETTINGS.tool_phrases:
+        return {"status": "tool-phrases-off"}
 
     if not _call.active:
         return {"status": "no-call"}

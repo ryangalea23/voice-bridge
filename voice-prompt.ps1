@@ -32,7 +32,7 @@ function Get-OnOffSetting($Vars, [string]$Name, [bool]$Default = $true) {
 
 # No double quotes in this text: Windows PowerShell 5.1 mangles them when
 # passing arguments to a native program.
-function Build-VoiceSystemPrompt([bool]$ConfirmRisky, [bool]$Coordinator) {
+function Build-VoiceSystemPrompt([bool]$ConfirmRisky, [bool]$Coordinator, [bool]$Narrate = $true) {
     $parts = @()
     if ($ConfirmRisky) {
         $parts += "This session is driven by voice over a phone call, and speech-to-text can mishear. " +
@@ -46,6 +46,14 @@ function Build-VoiceSystemPrompt([bool]$ConfirmRisky, [bool]$Coordinator) {
             "Hand any work expected to take more than about 10 seconds to background agents or background shell tasks " +
             "instead of doing it inline, and report each result in one sentence when it lands. " +
             "Keep replies short and speakable: no tables, no code blocks, no long lists."
+    }
+    if ($Narrate) {
+        $parts += "The caller hears everything you write, read out loud as you write it, so your text is the only thing " +
+            "filling the line. Start every reply with one short spoken sentence that shows you understood the request, " +
+            "before you use any tool, so the caller is never sitting in silence. " +
+            "When the next step will take more than a moment, say one short line about what you are about to do, then do it. " +
+            "One sentence at a time, plain spoken English, no lists, no markdown, and never read a file path out loud. " +
+            "Do not narrate quick steps, and do not say the same thing twice."
     }
     return ($parts -join ' ')
 }
