@@ -1,4 +1,4 @@
-# claude-voice.ps1 — Launch Claude Code for voice bridge use.
+# claude-voice.ps1 - Launch Claude Code for voice bridge use.
 # Registers this terminal with the bridge, sets HWND for inject.py.
 
 param([string]$WorkDir = "")
@@ -72,7 +72,7 @@ if ($window.Kind -eq 'none') {
     }
 }
 
-# Register with bridge (best-effort — bridge may not be running yet).
+# Register with bridge (best-effort - bridge may not be running yet).
 try {
     $body = @{ session_num = $sessionNum; hwnd = $hwnd.ToString() } | ConvertTo-Json
     Invoke-RestMethod -Uri "http://localhost:8000/session/register" `
@@ -80,7 +80,7 @@ try {
         -Headers @{ "X-Bridge-Token" = $bridgeToken } | Out-Null
     Write-Host "Registered with bridge as terminal $sessionNum" -ForegroundColor Cyan
 } catch {
-    Write-Host "Bridge not running — will register on first stop hook" -ForegroundColor Yellow
+    Write-Host "Bridge not running - will register on first stop hook" -ForegroundColor Yellow
 }
 
 $env:CLAUDE_VOICE_SESSION = "1"
