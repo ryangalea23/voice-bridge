@@ -238,6 +238,7 @@ log.info("Echo guard: %dms tail after outbound audio stops", ECHO_GUARD_MS)
 
 _playback_until: float = 0.0   # loop time when the audio we have queued runs out
 _last_spoken_text: str = ""    # exactly what the bridge is saying, or said last
+_last_spoken_at: float = 0.0   # when, so the echo net expires instead of lasting forever
 _prev_spoken_text: str = ""    # the one before that; echo often lags a sentence
 
 
@@ -258,7 +259,8 @@ def _reset_playback_clock() -> None:
 
 
 def _remember_spoken(text: str) -> None:
-    global _last_spoken_text, _prev_spoken_text
+    global _last_spoken_text, _prev_spoken_text, _last_spoken_at
+    _last_spoken_at = _now()
     if text != _last_spoken_text:
         _prev_spoken_text = _last_spoken_text
     _last_spoken_text = text
@@ -283,9 +285,22 @@ def _echo_guard_active() -> bool:
     return _now() < _playback_until + ECHO_GUARD_MS / 1000.0
 
 
+# How long after speaking our own words can still come back to us. Echo showed
+# up about 5 seconds late on a real call, so 10 seconds is comfortable, while
+# still letting the caller repeat a phrase we used once the moment has passed.
+ECHO_MEMORY_SECONDS = float(os.environ.get("ECHO_MEMORY_SECONDS", "10"))
+
+
 def _looks_like_echo(text: str) -> bool:
     """True when the utterance is our own voice coming back, matched against what
     we are saying now and the sentence before it."""
+    # The net remembers what we said for a short while, not forever. Echo can
+    # arrive a few seconds late, but a minute later the caller is simply
+    # talking. Without this limit, once Claude quoted the caller back ("I only
+    # caught 'why weren't you'"), the caller repeating that phrase was binned as
+    # echo and the call went dead.
+    if _now() > _last_spoken_at + ECHO_MEMORY_SECONDS:
+        return False
     if is_echo_of(text, _last_spoken_text):
         return True
     # The earlier sentence only counts while echo is still possible - the mic can

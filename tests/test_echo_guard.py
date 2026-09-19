@@ -146,13 +146,14 @@ def test_stop_word_during_tts_still_escapes(monkeypatch):
 
 # ── the last-spoken-text net ───────────────────────────────────────────────────
 
-def test_echo_of_last_spoken_dropped_outside_the_guard(monkeypatch, caplog):
+def test_echo_of_last_spoken_dropped_shortly_after_speaking(monkeypatch, caplog):
+    """Echo can lag a few seconds, so the memory outlives the audio itself."""
     caplog.set_level(logging.INFO, logger="bridge")
     h = Harness(monkeypatch)
 
     async def scenario():
         await h.speak("I heard: how many unread emails do i have")
-        h.clock.advance(60.0)         # long past any guard window
+        h.clock.advance(5.0)          # the delay seen on the real call
         await h.utter("I heard, how many unread emails do I have.")
 
     h.run(scenario)
@@ -160,12 +161,26 @@ def test_echo_of_last_spoken_dropped_outside_the_guard(monkeypatch, caplog):
     assert "repeats what the bridge just said" in caplog.text
 
 
-def test_prefix_of_last_spoken_dropped_outside_the_guard(monkeypatch):
+def test_caller_may_repeat_our_words_once_the_memory_expires(monkeypatch):
+    """The net used to last forever. Once Claude quoted the caller back, the
+    caller repeating that phrase was binned and the call went dead."""
+    h = Harness(monkeypatch)
+
+    async def scenario():
+        await h.speak("I only caught 'why weren't you' again, say the whole question")
+        h.clock.advance(bridge.ECHO_MEMORY_SECONDS + 1.0)
+        await h.utter("why weren't you answering me")
+
+    h.run(scenario)
+    assert h.injected == ["why weren't you answering me"]
+
+
+def test_prefix_of_last_spoken_dropped_shortly_after(monkeypatch):
     h = Harness(monkeypatch)
 
     async def scenario():
         await h.speak("I heard: how many unread emails do i have")
-        h.clock.advance(60.0)
+        h.clock.advance(5.0)
         await h.utter("i heard how many unread")
 
     h.run(scenario)

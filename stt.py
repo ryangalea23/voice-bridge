@@ -1,3 +1,4 @@
+import os
 """Deepgram streaming STT wrapper for Twilio 8kHz μ-law audio.
 
 Uses utterance_end_ms instead of endpointing — works correctly on phone calls
@@ -47,7 +48,7 @@ def build_live_options(
         channels=channels,
         interim_results=True,    # needed for utterance_end_ms buffering
         vad_events=True,         # enables SpeechStarted + UtteranceEnd
-        utterance_end_ms="2000", # 2s without new words = end of utterance
+        utterance_end_ms=os.environ.get("UTTERANCE_END_MS", "3000"), # 2s without new words = end of utterance
         endpointing=False,       # disable silence-based endpointing
         **keyterm_options(model, keyterms),
     )
