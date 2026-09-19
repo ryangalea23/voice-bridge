@@ -578,7 +578,6 @@ async def _speak_tool(text: str) -> None:
                 return
             await _call.outbound_q.put(chunk)
             _note_outbound_audio(chunk)
-            _chunks_sent += 1
     except Exception as exc:
         log.error("Tool speak error: %s", exc)
     finally:
@@ -616,6 +615,7 @@ async def _speak_content(text: str) -> None:
                 return
             await _call.outbound_q.put(chunk)
             _note_outbound_audio(chunk)
+            _chunks_sent += 1
     except Exception as exc:
         log.error("Content speak error: %s", exc)
     finally:
