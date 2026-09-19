@@ -578,6 +578,7 @@ async def _speak_tool(text: str) -> None:
                 return
             await _call.outbound_q.put(chunk)
             _note_outbound_audio(chunk)
+            _chunks_sent += 1
     except Exception as exc:
         log.error("Tool speak error: %s", exc)
     finally:
@@ -601,6 +602,8 @@ async def _speak_content(text: str) -> None:
     if not _call.active:
         return
 
+    log.info("Speaking %d chars: %r", len(text), text[:70])
+    _chunks_sent = 0
     _last_speech_time = asyncio.get_event_loop().time()
     _call.speaking = True
     _call.interrupted = False
@@ -616,6 +619,8 @@ async def _speak_content(text: str) -> None:
     except Exception as exc:
         log.error("Content speak error: %s", exc)
     finally:
+        log.info("Speech finished: %d chunks queued (%.1fs of audio)",
+                 _chunks_sent, _chunks_sent * 0.2)
         if _content_version == my_version:
             _call.speaking = False
 
@@ -829,10 +834,15 @@ async def _watch_transcript(path: str, start_pos: int) -> None:
             continue
 
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            # Binary, not text. os.path.getsize counts BYTES while a text read
+            # returns CHARACTERS, so one emoji or curly quote in the transcript
+            # put the next seek before where we had already read, and the
+            # watcher spoke old replies again.
+            with open(path, "rb") as f:
                 f.seek(pos)
-                new_data = f.read()
-            pos = size
+                chunk = f.read()
+            pos += len(chunk)
+            new_data = chunk.decode("utf-8", errors="replace")
         except OSError:
             continue
 
@@ -872,7 +882,8 @@ async def _watch_transcript(path: str, start_pos: int) -> None:
             if not _should_speak_reply(cleaned):
                 continue
 
-            log.info("Watcher speaking %d chars", len(cleaned))
+            log.info("Watcher speaking %d chars from byte %d: %r",
+                     len(cleaned), pos, cleaned[:70])
             _watcher_last_text = cleaned
             _watcher_spoke_this_turn = True
             asyncio.create_task(_speak_content(cleaned))
