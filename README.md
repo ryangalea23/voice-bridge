@@ -149,11 +149,31 @@ only possible while its audio is on the line plus `ECHO_GUARD_MS` after, so outs
 window everything you say goes straight through. Short words like "yes" or "no" are never
 treated as echo, even when the bridge just said them.
 
+Talking over it also stops the work, not just the voice. That is
+`BARGE_IN_STOPS_CLAUDE=on`, the default: cutting in presses Escape in the session window
+too, the same as saying "stop". The audio goes quiet first and the Escape follows a moment
+later, so cutting in never feels slow. Set it to `off` if you would rather the turn kept
+running while you say the next thing.
+
+**The answer to a turn you cut off is never read out.** It used to be. You would say
+"stop", the audio would go quiet, and three seconds later the finished answer arrived and
+was read from the beginning. Now every interruption that lands while a turn is running
+marks that turn, and when its answer turns up the bridge stays quiet and logs what it
+dropped. Turns are answered in the order you asked them, so cutting in and immediately
+saying the next thing still works: the old answer is dropped and the new one is spoken.
+
 **Stop command.** Say just "stop", "cancel", "wait", "hold on" or "never mind" and the
 bridge presses Escape in the session window to interrupt the current turn, stops the
 typing sound and says "Stopped." The word is not typed in as a prompt. It only counts when
 it is the whole thing you said, so "stop the server" is still sent as a normal request.
 Change the list with `VOICE_STOP_WORDS`.
+
+Speech to text loses the first sound of a short word now and then, so "stop" came through
+as "top" twice on one call and got typed in as a prompt. `VOICE_STOP_ALIASES` is a fixed
+list of extra spellings that count as the same command - "top" and "op" for "stop", and
+similar for the rest. It is a list, not a fuzzy match, on purpose: a stop word has to
+behave the same way every time, and "top of the file" is still sent as a normal request.
+An alias only counts when its command is one of your `VOICE_STOP_WORDS`.
 
 **Confirm risky actions (`CONFIRM_RISKY`).** On by default. `claude-voice.ps1` adds a line
 to the session's system prompt: before anything destructive or outward-facing (deleting
@@ -245,6 +265,53 @@ default, console first).
 
 Now call your number.
 
+## Calling out
+
+You can also have the bridge ring you instead of dialling in. `outbound-call.ps1` asks
+Twilio to place the call and points the answered call at the same `/twilio/voice` webhook:
+
+```powershell
+.\outbound-call.ps1 -To +15551112222
+```
+
+It reads your credentials and public URL from `.env`, and looks the caller ID up from
+`TWILIO_PHONE_SID` unless you pass `-From`. The number you dial has to be in
+`ALLOWED_CALLERS`, exactly as for an inbound call.
+
+**Answering-machine detection is the point of the script.** It sends
+`MachineDetection=Enable`, so Twilio works out what picked up and hands the bridge an
+`AnsweredBy` value with the webhook. If that says a machine or a fax, the bridge hangs up
+and no audio is ever transcribed. Without it, a voicemail greeting gets transcribed and
+typed into your session as a prompt - which is exactly what happened on a real call, where
+"your call has been forwarded to voice mail" became 364 keystrokes into Claude Code.
+
+`unknown` and a missing value count as a person, so a real call is never dropped because
+detection could not decide. `-MachineDetectionTimeout` (15 seconds by default) caps how
+long Twilio may spend deciding; someone who answers waits at most that long.
+`-MachineDetection DetectMessageEnd` waits for a greeting to finish instead, which is only
+useful if you mean to leave a message.
+
+None of this touches inbound calls. Detection only exists on a call Twilio placed, the
+bridge only reads `AnsweredBy` when Twilio marks the call outbound, and a call to your
+number takes exactly the path it always did.
+
+If you would rather place the call by hand, this is the same request:
+
+```powershell
+$creds = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$AccountSid`:$AuthToken"))
+Invoke-RestMethod -Method Post `
+  -Uri "https://api.twilio.com/2010-04-01/Accounts/$AccountSid/Calls.json" `
+  -Headers @{ Authorization = "Basic $creds" } `
+  -Body @{
+      To = "+15551112222"
+      From = "+15559990000"
+      Url = "https://your-tunnel-hostname.example.com/twilio/voice"
+      Method = "POST"
+      MachineDetection = "Enable"
+      MachineDetectionTimeout = 15
+  }
+```
+
 ## Files
 
 | File | Job |
@@ -265,6 +332,7 @@ Now call your number.
 | `window-handle.ps1` | Picks the window for the fallback path: the console, or the terminal app under ConPTY |
 | `check-window.ps1` | Prints which window the fallback would use, without launching Claude Code |
 | `voice-prompt.ps1` | Builds the confirm and coordinator system prompt text |
+| `outbound-call.ps1` | Places an outbound call with answering-machine detection on |
 | `tests/` | pytest suite. No phone, Deepgram or network needed: `python -m pytest tests` |
 
 ## Why Windows only
@@ -283,6 +351,11 @@ Deepgram, FastAPI, edge-tts, is cross-platform already. Pull requests welcome.
 - **The fallback path takes your clipboard and steals focus.** It only runs when writing
   to the console fails, and you can switch it off with `INJECT_METHOD=console`.
 - **One call at a time.** There is a single global call object, not a pool.
+- **A stopped turn is given four seconds to send something back.** Escape usually leaves a
+  part-written answer behind, which arrives at once and is dropped. If nothing arrives in
+  that window the bridge assumes the turn died silently and stops waiting, so the next
+  answer is spoken. Claude Code gives the bridge no turn id, so the order replies arrive in
+  is all there is to go on.
 - **The tunnel URL changes** on every restart with a free Cloudflare quick tunnel, which is
   why `bridge.ps1` rewrites the Twilio webhook each time. A named tunnel avoids this.
 - **Deepgram and Twilio both cost money** per minute. Small, not zero.

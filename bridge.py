@@ -1,7 +1,11 @@
 """Twilio voice bridge — routes phone calls to Claude Code CLI and back.
 
 Routes:
-  POST /twilio/voice          — Twilio webhook; returns TwiML to open Media Stream
+  POST /twilio/voice          — Twilio webhook; returns TwiML to open Media Stream.
+                                Answers inbound calls, and outbound calls placed by
+                                outbound-call.ps1. On an outbound call it reads Twilio's
+                                AnsweredBy and hangs up on a machine, so a voicemail
+                                greeting is never transcribed.
   WS   /twilio/stream         — Twilio Media Streams WebSocket (inbound + outbound)
   POST /session/register      — claude-voice.ps1 calls this on launch
   POST /session/deregister    — claude-voice.ps1 calls this on exit
@@ -153,6 +157,33 @@ _ack_idx: int = 0
 _tool_busy: int = 0
 _turn_active: bool = False
 
+# ── Interrupted turns ──────────────────────────────────────────────────────────
+#
+# Cutting the bridge off used to stop only the voice. The turn kept running, and
+# when it finished the answer arrived at /hook/assistant-text and was spoken from
+# the top - the caller had moved on a sentence ago. So every interruption that
+# lands while a turn is in flight writes one entry here, and the next reply to
+# reach us is that turn's reply and gets dropped.
+#
+# The queue is what makes "cut in, then immediately say the next thing" work.
+# Claude answers in the order it was asked, so the first reply after an
+# interruption belongs to the cut-off turn and the one after it belongs to the
+# new request. One entry, one dropped reply, and the new request is spoken.
+#
+# The Escape case needs a time limit. A turn that was stopped with Escape often
+# leaves a part-written answer behind, which arrives within a second or two; if
+# nothing arrives in that window the turn died silently and the entry has to go,
+# or it would swallow a later, perfectly good answer.
+_ESCAPED_DROP_GRACE_S = 4.0
+
+# Each entry: {"at": float, "escaped": bool}
+_pending_drops: list[dict] = []
+# One decision per reply, reused for every block of that same reply. A long
+# answer reaches the watcher in pieces and they all belong to one turn.
+_reply_verdict: Optional[bool] = None
+_turn_seq: int = 0
+_reply_verdict_turn: int = -1
+
 # ── Echo guard ─────────────────────────────────────────────────────────────────
 #
 # The caller's phone speaker plays our own voice back into its microphone, so
@@ -297,6 +328,7 @@ class _CallState:
         self.stop_hint_given = False
         _reset_playback_clock()
         _forget_spoken()
+        _forget_interrupted_turns()
 
 _call = _CallState()
 
@@ -365,6 +397,38 @@ def _reject_twiml() -> str:
     )
 
 
+def _hangup_twiml() -> str:
+    """No greeting, no stream, nothing typed anywhere. Just go away."""
+    return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+
+
+# Twilio's answering-machine detection reports what picked up in AnsweredBy.
+# Anything but a person means there is no one to talk to, so the bridge hangs up
+# rather than transcribing a voicemail greeting and typing it into the terminal.
+# "unknown" and an empty value mean detection did not run or could not decide,
+# and those are treated as a person so a real call is never dropped.
+_HUMAN_ANSWERS = ("human", "unknown", "")
+
+
+def _is_outbound(params: dict) -> bool:
+    """Twilio sends Direction=inbound for a call to the number, and
+    outbound-api / outbound-dial when something placed the call."""
+    return params.get("Direction", "inbound").lower().startswith("outbound")
+
+
+def _machine_answered(params: dict) -> str:
+    """The AnsweredBy value when a machine picked up, else an empty string.
+
+    Only ever consulted for outbound calls. An inbound call never carries
+    AnsweredBy, and is never asked about it, so this cannot change what happens
+    when the phone rings here.
+    """
+    if not _is_outbound(params):
+        return ""
+    answered_by = params.get("AnsweredBy", "").strip().lower()
+    return "" if answered_by in _HUMAN_ANSWERS else answered_by
+
+
 def _session_authorized(request: Request) -> bool:
     if not SESSION_TOKEN:
         return False
@@ -389,13 +453,39 @@ async def twilio_voice(request: Request):
             return Response(status_code=403)
 
     # A valid Twilio signature only proves Twilio sent the webhook. It says
-    # nothing about who dialled, so check the caller before handing them a
-    # live terminal.
-    caller = params.get("From", "")
-    if not _caller_allowed(caller):
-        log.warning("Rejected call from %s (not in ALLOWED_CALLERS)", caller or "<unknown>")
+    # nothing about who is on the phone, so check the number before handing it a
+    # live terminal. On an inbound call that is From, the person dialling. On an
+    # outbound call From is our own Twilio number and the person is To, so the
+    # allowlist is checked against the number that was dialled. Either way the
+    # human end of the call has to be on the list, and an empty list still
+    # rejects everything.
+    outbound = _is_outbound(params)
+    human_end = params.get("To", "") if outbound else params.get("From", "")
+    if not _caller_allowed(human_end):
+        log.warning(
+            "Rejected %s call with %s (not in ALLOWED_CALLERS)",
+            "outbound" if outbound else "inbound",
+            human_end or "<unknown>",
+        )
         return Response(content=_reject_twiml(), media_type="application/xml")
-    log.info("Accepted call from %s", caller)
+
+    # Outbound only: if a machine picked up, hang up. Nothing is transcribed and
+    # nothing is typed, which is the whole point - a voicemail greeting used to
+    # be injected as a prompt.
+    machine = _machine_answered(params)
+    if machine:
+        log.warning(
+            "Outbound call to %s was answered by %s - hanging up, nothing injected",
+            human_end, machine,
+        )
+        return Response(content=_hangup_twiml(), media_type="application/xml")
+
+    log.info(
+        "Accepted %s call with %s%s",
+        "outbound" if outbound else "inbound",
+        human_end,
+        f" (answered by {params.get('AnsweredBy', '')})" if outbound and params.get("AnsweredBy") else "",
+    )
 
     host = request.headers.get("host", "localhost:8000")
     # Bind this accepted call to the socket Twilio is about to open.
@@ -556,8 +646,11 @@ async def _typing_loop() -> None:
 
 
 def _start_typing() -> None:
-    global _typing_task, _turn_active
+    global _typing_task, _turn_active, _turn_seq
     _turn_active = True
+    # A new turn, so whatever was decided about the last turn's reply does not
+    # apply to this one.
+    _turn_seq += 1
     # A new turn means the user's barge-in has been handled. This flag used to be
     # cleared by the spoken acknowledgement, which no longer exists, so clearing
     # it here is what keeps the typing loop from silently skipping every chunk.
@@ -740,6 +833,9 @@ async def _watch_transcript(path: str, start_pos: int) -> None:
             if not cleaned:
                 continue
 
+            if not _should_speak_reply(cleaned):
+                continue
+
             log.info("Watcher speaking %d chars", len(cleaned))
             _watcher_last_text = cleaned
             _watcher_spoke_this_turn = True
@@ -776,10 +872,80 @@ async def _clear_audio() -> None:
         except Exception as exc:
             log.warning("Could not send clear: %s", exc)
 
+
+def _stop_spellings() -> tuple[str, ...]:
+    """Every spelling that counts as a stop word: the words themselves plus the
+    clipped forms Deepgram hands back, such as "top" for "stop"."""
+    return tuple(SETTINGS.stop_words) + tuple(SETTINGS.stop_aliases)
+
+
+def _forget_interrupted_turns() -> None:
+    global _reply_verdict, _reply_verdict_turn
+    _pending_drops.clear()
+    _reply_verdict = None
+    _reply_verdict_turn = -1
+
+
+def _note_interrupted_turn(escaped: bool) -> None:
+    """Remember that the turn in flight was cut off, so when its answer finally
+    arrives the bridge stays quiet instead of reading out old news. Nothing to
+    remember when no turn is running: there is no reply on its way."""
+    if not _turn_active:
+        return
+    _pending_drops.append({"at": _now(), "escaped": escaped})
+    log.info(
+        "Turn interrupted%s - its reply will be dropped",
+        " with Escape" if escaped else "",
+    )
+
+
+def _forget_stale_drops() -> None:
+    """Give up on a stopped turn that never sent anything back."""
+    while _pending_drops:
+        head = _pending_drops[0]
+        if not head["escaped"]:
+            # Not stopped, only talked over, so it is still working and its reply
+            # is still coming. Wait for it however long it takes.
+            return
+        if _now() - head["at"] <= _ESCAPED_DROP_GRACE_S:
+            return
+        _pending_drops.pop(0)
+        log.info("A stopped turn sent nothing back - the next reply is fair game")
+
+
+def _should_speak_reply(text: str) -> bool:
+    """False when this reply belongs to a turn the caller cut off."""
+    global _reply_verdict, _reply_verdict_turn
+    if _reply_verdict is not None and _reply_verdict_turn == _turn_seq:
+        return _reply_verdict
+    _forget_stale_drops()
+    verdict = True
+    if _pending_drops:
+        _pending_drops.pop(0)
+        verdict = False
+        first_words = " ".join(text.split())[:60]
+        log.info("Dropped the reply to an interrupted turn: %r", first_words)
+    _reply_verdict = verdict
+    _reply_verdict_turn = _turn_seq
+    return verdict
+
+
+def _end_reply_stream() -> None:
+    """The turn is over, so the next reply gets its own decision."""
+    global _reply_verdict, _reply_verdict_turn
+    _reply_verdict = None
+    _reply_verdict_turn = -1
+
+
 async def _barge_in(reason: str) -> None:
     """The caller talked over us and it is not our own voice coming back. Stop
     speaking at once: cancel the sentence in flight, drop our queue, and tell
-    Twilio to throw away what it is already holding."""
+    Twilio to throw away what it is already holding.
+
+    With BARGE_IN_STOPS_CLAUDE=on this also presses Escape, so cutting in stops
+    the work and not just the voice. The Escape goes out on its own task: it
+    reaches into a console window and can take a moment, and nothing may delay
+    the audio going quiet."""
     global _content_version, _tool_version
     log.info("Barge-in: %s", reason)
     # Bumping both versions makes the running _speak_content and _speak_tool
@@ -790,7 +956,25 @@ async def _barge_in(reason: str) -> None:
     # The cancelled _speak_content will not clear this itself - its own version
     # check no longer matches - so clear it here.
     _call.speaking = False
+    stops_claude = SETTINGS.barge_in_stops_claude and _turn_active
+    _note_interrupted_turn(escaped=stops_claude)
+    if stops_claude:
+        # Stop the typing sound here rather than on the Escape task. The caller
+        # often says the next thing straight away, and a _stop_typing arriving
+        # late would silence the new turn instead of the old one.
+        _stop_typing()
     await _clear_audio()
+    if stops_claude:
+        asyncio.create_task(_escape_after_barge_in())
+
+
+async def _escape_after_barge_in() -> None:
+    """Press Escape for a barge-in, after the audio has already stopped."""
+    ok = await asyncio.get_event_loop().run_in_executor(None, send_escape)
+    if ok:
+        log.info("Barge-in sent Escape - the turn is stopped")
+    else:
+        log.warning("Barge-in could not send Escape - the turn keeps running")
 
 
 async def _on_speech_started() -> None:
@@ -862,6 +1046,7 @@ def _no_session_phrase(fallback_tail: str) -> str:
 async def _handle_stop() -> None:
     """Interrupt the running turn instead of typing the stop word as a prompt."""
     log.info("Stop command - sending Escape")
+    _note_interrupted_turn(escaped=True)
     ok = await asyncio.get_event_loop().run_in_executor(None, send_escape)
     _stop_typing()
     if ok:
@@ -879,7 +1064,7 @@ async def _on_utterance(text: str) -> None:
 
     # Stop words are checked before the echo guard: interrupting has to work
     # while the bridge is talking, which is exactly when the guard is on.
-    if is_stop_command(text, SETTINGS.stop_words):
+    if is_stop_command(text, _stop_spellings()):
         await _handle_stop()
         return
 
@@ -1154,7 +1339,14 @@ async def assistant_text(request: Request) -> dict:
     # Active session — skip if watcher already spoke
     if _watcher_spoke_this_turn:
         log.info("Watcher already spoke this turn — Stop hook skipping")
+        _end_reply_stream()
         return {"status": "watcher-spoke"}
+
+    speak = _should_speak_reply(text)
+    # The turn is over either way, so the next reply gets a fresh decision.
+    _end_reply_stream()
+    if not speak:
+        return {"status": "interrupted"}
 
     asyncio.create_task(_speak_content(text))
     return {"status": "queued", "chars": len(text)}

@@ -28,6 +28,24 @@ DEFAULT_ACK = "off"
 DEFAULT_HAIKU_TIMEOUT_MS = 2500
 DEFAULT_STOP_WORDS = ("stop", "cancel", "wait", "hold on", "never mind")
 
+# Deepgram sometimes loses the first sound of an utterance, so "stop" arrives as
+# "top" and the bridge typed it as a prompt instead of stopping. These are the
+# extra spellings that count as the same command. This is a fixed list on
+# purpose: a fuzzy or threshold match would make "top of the file" a coin flip,
+# and a stop word has to be predictable. An alias only counts when its command
+# is one of the stop words in use.
+DEFAULT_STOP_ALIASES: dict[str, tuple[str, ...]] = {
+    "stop": ("top", "op", "stopp", "stahp"),
+    "cancel": ("ancel", "cansel"),
+    "wait": ("ait", "weight"),
+    "hold on": ("old on", "holdon"),
+    "never mind": ("nevermind", "ever mind"),
+}
+
+# on: talking over the bridge also presses Escape, so the caller cutting in
+# stops the work as well as the voice. off: it only stops the voice.
+DEFAULT_BARGE_IN_STOPS_CLAUDE = True
+
 
 @dataclass(frozen=True)
 class VoiceSettings:
@@ -35,12 +53,79 @@ class VoiceSettings:
     readback: str = DEFAULT_READBACK
     haiku_timeout_ms: int = DEFAULT_HAIKU_TIMEOUT_MS
     stop_words: tuple[str, ...] = DEFAULT_STOP_WORDS
+    stop_aliases: tuple[str, ...] = field(default_factory=tuple)
+    barge_in_stops_claude: bool = DEFAULT_BARGE_IN_STOPS_CLAUDE
     deepgram_keyterms: tuple[str, ...] = field(default_factory=tuple)
     anthropic_api_key: str = ""
 
 
 def _split_list(raw: str) -> tuple[str, ...]:
     return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+_TRUE = ("on", "true", "1", "yes")
+_FALSE = ("off", "false", "0", "no")
+
+
+def _load_flag(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    log.warning(
+        "%s=%r is not on or off - using %s", name, raw, "on" if default else "off"
+    )
+    return default
+
+
+def _parse_alias_map(raw: str) -> dict[str, tuple[str, ...]]:
+    """Parse VOICE_STOP_ALIASES, e.g. "stop=top|op,wait=ait"."""
+    out: dict[str, tuple[str, ...]] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        command, _, spellings = entry.partition("=")
+        command = " ".join(command.lower().split())
+        parsed = tuple(
+            " ".join(s.lower().split()) for s in spellings.split("|") if s.strip()
+        )
+        if command and parsed:
+            out[command] = out.get(command, ()) + parsed
+    return out
+
+
+def _load_stop_aliases(
+    env: Mapping[str, str], stop_words: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The extra spellings that count as a stop word, for the words in use only."""
+    raw = env.get("VOICE_STOP_ALIASES")
+    if raw is None:
+        alias_map = DEFAULT_STOP_ALIASES
+    elif not raw.strip():
+        # An explicit empty value turns the aliases off.
+        return ()
+    else:
+        alias_map = _parse_alias_map(raw)
+        if not alias_map:
+            log.warning(
+                "VOICE_STOP_ALIASES=%r has no command=spelling pairs - using the defaults",
+                raw,
+            )
+            alias_map = DEFAULT_STOP_ALIASES
+
+    words = set(stop_words)
+    out: list[str] = []
+    for command, spellings in alias_map.items():
+        if command not in words:
+            continue
+        for spelling in spellings:
+            if spelling not in words and spelling not in out:
+                out.append(spelling)
+    return tuple(out)
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
@@ -90,6 +175,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
         readback=readback,
         haiku_timeout_ms=timeout_ms,
         stop_words=stop_words,
+        stop_aliases=_load_stop_aliases(env, stop_words),
+        barge_in_stops_claude=_load_flag(
+            env, "BARGE_IN_STOPS_CLAUDE", DEFAULT_BARGE_IN_STOPS_CLAUDE
+        ),
         deepgram_keyterms=_split_list(env.get("DEEPGRAM_KEYTERMS", "")),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", "").strip(),
     )
@@ -98,11 +187,14 @@ def load_settings(env: Mapping[str, str] | None = None) -> VoiceSettings:
 def log_settings(s: VoiceSettings) -> None:
     log.info(
         "Voice settings: ACK_MODE=%s READBACK=%s READBACK_HAIKU_TIMEOUT_MS=%d "
-        "VOICE_STOP_WORDS=%s DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
+        "VOICE_STOP_WORDS=%s VOICE_STOP_ALIASES=%s BARGE_IN_STOPS_CLAUDE=%s "
+        "DEEPGRAM_KEYTERMS=%s ANTHROPIC_API_KEY=%s",
         s.ack_mode,
         s.readback,
         s.haiku_timeout_ms,
         ",".join(s.stop_words),
+        ",".join(s.stop_aliases) or "<none>",
+        "on" if s.barge_in_stops_claude else "off",
         ",".join(s.deepgram_keyterms) or "<none>",
         "set" if s.anthropic_api_key else "<not set>",
     )
