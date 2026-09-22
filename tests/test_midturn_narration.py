@@ -61,7 +61,7 @@ def test_narration_is_spoken_while_the_turn_is_still_running(tmp_path, monkeypat
 
             # 3. The real answer ends the turn.
             with open(path, "ab") as f:
-                f.write(_assistant_line("It is 68 and sunny in Larchmont.").encode("utf-8"))
+                f.write(_assistant_line("It is 68 and sunny in Springfield.").encode("utf-8"))
             await asyncio.sleep(0.4)
             bridge._turn_active = False
             await asyncio.sleep(0.2)
@@ -77,7 +77,7 @@ def test_narration_is_spoken_while_the_turn_is_still_running(tmp_path, monkeypat
     assert texts == [
         "Sure, let me look that up.",
         "Let me check the forecast.",
-        "It is 68 and sunny in Larchmont.",
+        "It is 68 and sunny in Springfield.",
     ]
     # The first two were spoken while the turn was still running, which is the
     # claim being tested. Only the last one lands after the turn is done.
